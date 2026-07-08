@@ -1,5 +1,18 @@
-import { scanMachine } from "./scanner.js";
+import express from "express";
 
-const info = await scanMachine();
+import machineRoute from "./routes/machine.js";
+import generateRoute from "./routes/generate.js";
 
-console.log(JSON.stringify(info, null, 2));
+const app = express();
+
+app.use(express.json());
+
+app.use("/machine", machineRoute);
+
+app.use("/api/generate", generateRoute);
+
+app.listen(3000, () => {
+
+    console.log("TeamGPU Agent Running");
+
+});
