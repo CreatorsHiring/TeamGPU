@@ -1,55 +1,55 @@
-import readline from "node:readline";
+function getArg(name) {
+    const index = process.argv.indexOf(name);
 
-const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
-});
+    if (index === -1) {
+        return null;
+    }
 
-function ask(question) {
-    return new Promise(resolve => {
-        rl.question(question, resolve);
-    });
+    return process.argv[index + 1];
 }
 
 async function main() {
-    try {
-        const server = await ask("TeamGPU Server (default: http://localhost:3000): ");
+    const server = getArg("--server") || "http://localhost:3000";
+    const model = getArg("--model");
+    const prompt = getArg("--prompt");
 
-        const model = await ask("Model: ");
+    if (!model || !prompt) {
+        console.log(`
+Usage:
 
-        const prompt = await ask("Prompt: ");
-
-        console.log("\nGenerating...\n");
-
-        const response = await fetch(
-            (server || "http://localhost:3000") + "/api/generate",
-            {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                    model,
-                    prompt
-                })
-            }
-        );
-
-        if (!response.ok) {
-            throw new Error(`Server returned ${response.status}`);
-        }
-
-        const data = await response.json();
-
-        console.log("========== Response ==========\n");
-
-        console.log(data.response);
-
-    } catch (err) {
-        console.error(err.message);
-    } finally {
-        rl.close();
+node src/cli/generate.js \
+  --server http://localhost:3000 \
+  --model qwen2.5-coder:1.5b \
+  --prompt "Write Bubble Sort in Java"
+`);
+        process.exit(1);
     }
+
+    console.log(`Connecting to ${server}`);
+    console.log(`Model: ${model}`);
+    console.log("Generating...\n");
+
+    const response = await fetch(`${server}/api/generate`, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+            model,
+            prompt
+        })
+    });
+
+    if (!response.ok) {
+        console.error(`Server returned ${response.status}`);
+        console.error(await response.text());
+        process.exit(1);
+    }
+
+    const data = await response.json();
+
+    console.log("========== Response ==========\n");
+    console.log(data.response);
 }
 
-main();
+main().catch(console.error);
