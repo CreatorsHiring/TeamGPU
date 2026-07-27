@@ -44,7 +44,7 @@ router.post("/", async (req, res) => {
 
                     prompt,
 
-                    stream: false
+                    stream: true
 
                 })
 
@@ -62,9 +62,22 @@ router.post("/", async (req, res) => {
 
         }
 
-        const data = await response.json();
+        res.setHeader("Content-Type", "application/x-ndjson");
 
-        return res.json(data);
+        const reader = response.body.getReader();
+
+        while (true) {
+
+            const { done, value } = await reader.read();
+
+            if (done) {
+                break;
+            }
+
+            res.write(Buffer.from(value));
+        }
+
+        res.end();
 
     }
 
