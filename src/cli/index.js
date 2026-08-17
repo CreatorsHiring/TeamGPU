@@ -1,5 +1,4 @@
-const command = process.argv[2];
-
+#!/usr/bin/env node
 const command = process.argv[2];
 
 switch (command) {

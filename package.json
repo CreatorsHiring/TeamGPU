@@ -2,6 +2,9 @@
   "name": "teamgpu-agent",
   "version": "0.0.1",
   "type": "module",
+    "bin": {
+    "teamgpu": "./src/cli/index.js"
+  },
   "scripts": {
     "start": "node src/index.js"
   },
