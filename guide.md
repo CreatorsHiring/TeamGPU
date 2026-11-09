@@ -14,7 +14,7 @@ Build TeamGPU in two stages:
 
 2. A desktop application that discovers available TeamGPU laptops, displays their hardware and available models, and lets the user select a laptop and chat with its LLM.
 
-The current project already has most of the first-stage behavior. The CLI loop in `src/cli/commands/run.js` stores user and assistant messages, sends the full conversation to `POST /api/generate`, and prints streamed Ollama tokens. The main missing piece for a different laptop is configurable server discovery/selection instead of a hardcoded `localhost`.
+The current project already has most of the first-stage behavior. The CLI loop in `src/cli/commands/run.js` stores user and assistant messages, sends the full conversation to `POST /api/generate`, and prints streamed Ollama tokens. The main product gap is automatic host discovery and selection instead of asking users to enter IP addresses or server URLs.
 
 ## Recommended product model: one TeamGPU installer
 
@@ -91,12 +91,17 @@ If the user chooses to use available laptops:
 4. Let the user select a device and model.
 5. Open a chat view with streaming responses.
 
-If no registry account is available in the first MVP, provide a manual local-network option:
+If no registry account is available in the first MVP, automatically scan the local network:
 
 ```text
-No registered laptops found.
-[Scan local network] [Add device URL manually]
+Searching for TeamGPU laptops...
+
+Available laptops:
+1. Gaming-PC — RTX 3090 — qwen2.5-coder:1.5b — Online
+2. Workstation-A — RTX 4090 — llama3.2 — Online
 ```
+
+Manual device URLs should be a developer/troubleshooting fallback, not part of the normal onboarding flow.
 
 ### CLI behavior after installation
 
@@ -184,27 +189,31 @@ The server should remain the only component that talks directly to Ollama. Clien
 
 ## Stage 1: Finish the terminal experience
 
-### 1. Make the server URL configurable
+### 1. Discover hosts automatically
 
-The current CLI uses `http://localhost:3000`, which only works when the CLI and TeamGPU server are on the same laptop.
+The normal user must not need to know a host's IP address, port, or URL. TeamGPU should:
 
-Support a clear priority order:
+1. Give each host a stable device ID and display name.
+2. Advertise the host on the local network using a discovery protocol such as mDNS/DNS-SD.
+3. Have the client listen for TeamGPU host announcements.
+4. Query each discovered host's health and machine metadata.
+5. Show only reachable hosts with their GPU and available models.
+6. Store the selected device ID, not a hardcoded IP address.
+7. refresh the resolved address when the host's DHCP address changes.
 
-1. Explicit command-line option:
+The client flow should be:
 
-   ```text
-   teamgpu run qwen2.5-coder:1.5b --server http://192.168.1.25:3000
-   ```
+```text
+teamgpu
+  -> Discovering TeamGPU laptops...
+  -> Choose a laptop
+  -> Choose an available model
+  -> Chat
+```
 
-2. Environment variable:
+The client may use an IP address internally, but that detail must be hidden from the user.
 
-   ```powershell
-   $env:TEAMGPU_SERVER="http://192.168.1.25:3000"
-   ```
-
-3. A documented default of `http://localhost:3000`.
-
-Validate the URL before starting the chat and show the selected server to the user.
+For devices on different networks, local discovery is insufficient. Use a central authenticated registry or relay: hosts make outbound connections to the registry, and clients retrieve the authorized device list by stable device ID. Do not attempt to discover arbitrary public IP addresses.
 
 ### 2. Verify the selected server before chatting
 
@@ -312,7 +321,7 @@ For the first remote version:
 1. Run TeamGPU on the laptop with the GPU.
 2. Bind the server to a network-accessible interface instead of only loopback if required.
 3. Open only the TeamGPU port, normally `3000`, in the host firewall.
-4. Connect using the laptop's private IP address.
+4. Let the TeamGPU client discover the laptop automatically.
 5. Keep Ollama bound to `127.0.0.1:11434`.
 
 Never expose Ollama directly to the LAN or internet.
@@ -353,10 +362,10 @@ Extend `GET /machine` or add a versioned endpoint such as `GET /api/v1/device`.
 
 Implement discovery in increasing order of complexity:
 
-1. Manual server URL entry.
-2. Saved devices in the desktop app.
-3. LAN discovery using a local registry or mDNS.
-4. A small authenticated coordination service for devices across networks.
+1. LAN discovery using mDNS/DNS-SD.
+2. Saved devices by stable device ID.
+3. A small authenticated coordination service for devices across networks.
+4. A secure relay for hosts that cannot accept inbound connections.
 
 For cross-network access, use an authenticated relay or private VPN rather than exposing every laptop directly.
 
@@ -418,17 +427,16 @@ The selected device's model determines the available context window and generati
 
 ## Recommended implementation order
 
-1. Add server URL parsing to `teamgpu run`.
-2. Add `/machine` preflight checks.
-3. Improve streaming error and cancellation handling.
-4. Add `/status`, `/models`, and `/help`.
-5. Add configurable host, port, and environment-based configuration.
-6. Add authentication and HTTPS for non-trusted networks.
-7. Version the API under `/api/v1`.
-8. Add device identity and health metadata.
-9. Build manual multi-device selection in a desktop prototype.
-10. Add LAN discovery.
-11. Add a secure cross-network registry/relay.
+1. Add `/machine` preflight checks.
+2. Improve streaming error and cancellation handling.
+3. Add `/status`, `/models`, and `/help`.
+4. Add stable host identity and machine metadata.
+5. Add LAN discovery with mDNS/DNS-SD.
+6. Build automatic laptop/model selection in the CLI.
+7. Add authentication and HTTPS for non-trusted networks.
+8. Version the API under `/api/v1`.
+9. Build multi-device selection in a desktop prototype.
+10. Add a secure cross-network registry/relay.
 12. Package signed desktop and CLI releases.
 
 ## Acceptance criteria
