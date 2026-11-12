@@ -1,404 +1,172 @@
 import readline from "node:readline";
-
-const SERVER = "http://localhost:3000";
-
+import { discoverHosts, probeHost } from "../../discovery/client.js";
+import {
+    colors,
+    printSplash,
+    promptHostInput,
+    promptModelInput,
+    printModelPicker,
+    printChatTopBar,
+    printUserMessage,
+    printAssistantMeta,
+    renderChatInputCard,
+    getPromptPrefix,
+    getCardLeftPad
+} from "../tui.js";
+import { runChatInterface } from "../chatTui.js";
 
 function createInterface() {
-
     return readline.createInterface({
         input: process.stdin,
         output: process.stdout
     });
-
 }
-
 
 function ask(rl, question) {
-
     return new Promise(resolve => {
-        rl.question(question, resolve);
+        rl.question(question, (answer) => {
+            process.stdout.write(colors.reset);
+            resolve(answer);
+        });
     });
-
 }
 
+/**
+ * Prompts user to select an available host using OpenCode layout.
+ */
+async function selectHostPrompt(rl, { directServer = null } = {}) {
+    if (directServer) {
+        console.log(`Connecting directly to: ${colors.orange}${directServer}${colors.reset}`);
+        const probed = await probeHost(directServer, 3000);
+        if (!probed) {
+            console.error(`\n${colors.red}[Error] Unable to reach TeamGPU server at ${directServer}${colors.reset}`);
+            return null;
+        }
+        return probed;
+    }
 
-/*
----------------------------------------
-Read streamed response from TeamGPU
----------------------------------------
-*/
-
-async function streamResponse(response) {
-
-    const reader = response.body.getReader();
-
-    const decoder = new TextDecoder();
-
-    let buffer = "";
-
-    let assistantResponse = "";
-
+    let hosts = null;
 
     while (true) {
-
-        const { done, value } = await reader.read();
-
-        if (done) {
-            break;
+        if (!hosts) {
+            console.log(`\n${colors.dim}Scanning local network for TeamGPU laptops...${colors.reset}`);
+            hosts = await discoverHosts({ timeoutMs: 2000 });
         }
 
+        const answer = await promptHostInput(rl, hosts);
+        const trimmed = (answer || "").trim();
 
-        buffer += decoder.decode(value, {
-            stream: true
-        });
-
-
-        const lines = buffer.split("\n");
-
-        buffer = lines.pop();
-
-
-        for (const line of lines) {
-
-            if (!line.trim()) {
+        if (hosts.length === 0) {
+            hosts = null;
+            const act = trimmed.toLowerCase();
+            if (act === "r" || act === "") {
                 continue;
-            }
-
-
-            try {
-
-                const data = JSON.parse(line);
-
-
-                /*
-                Ollama /api/chat returns:
-
-                {
-                    message: {
-                        role: "assistant",
-                        content: "Hello"
-                    },
-                    done: false
+            } else if (act === "m") {
+                const promptPrefix = getPromptPrefix();
+                const urlInput = await ask(rl, `${promptPrefix}Host URL (e.g. http://192.168.0.5:3000): `);
+                if (urlInput.trim()) {
+                    const probed = await probeHost(urlInput.trim(), 3000);
+                    if (probed) return probed;
+                    console.log(`\n${colors.red}Could not reach specified host.${colors.reset}`);
+                    await new Promise(r => setTimeout(r, 1200));
                 }
-                */
-
-
-                if (data.message?.content) {
-
-                    const content =
-                        data.message.content;
-
-
-                    // Print immediately
-                    process.stdout.write(content);
-
-
-                    // Save for conversation memory
-                    assistantResponse += content;
-
-                }
-
+            } else {
+                return null;
             }
-
-            catch (error) {
-
-                console.error(
-                    "\nFailed to parse response chunk."
-                );
-
-            }
-
+            continue;
         }
 
+        const num = parseInt(trimmed, 10);
+        if (!isNaN(num) && num >= 1 && num <= hosts.length) {
+            return hosts[num - 1];
+        }
+
+        const leftPad = getCardLeftPad();
+        console.log(`\n${leftPad}${colors.red}Invalid choice. Enter a number between 1 and ${hosts.length}.${colors.reset}`);
+        await new Promise(r => setTimeout(r, 1200));
     }
-
-
-    /*
-    ---------------------------------------
-    Decode final remaining bytes
-    ---------------------------------------
-    */
-
-    buffer += decoder.decode();
-
-
-    if (buffer.trim()) {
-
-        try {
-
-            const data = JSON.parse(buffer);
-
-
-            if (data.message?.content) {
-
-                const content =
-                    data.message.content;
-
-                process.stdout.write(content);
-
-                assistantResponse += content;
-
-            }
-
-        }
-
-        catch (error) {
-
-            console.error(
-                "\nFailed to parse final response."
-            );
-
-        }
-
-    }
-
-
-    return assistantResponse;
-
 }
 
+/**
+ * Prompts user to select a model on the chosen host using OpenCode layout.
+ */
+async function selectModelPrompt(rl, host, currentModel = null) {
+    const refreshed = await probeHost(host.url, 2000);
+    const models = refreshed?.models || host.models || [];
+    const promptPrefix = getPromptPrefix();
 
-/*
----------------------------------------
-Main CLI command
----------------------------------------
-*/
-
-export async function run(model) {
-
-    if (!model) {
-
-        console.log(`
-Usage:
-
-teamgpu run <model>
-
-Example:
-
-teamgpu run qwen2.5-coder:1.5b
-`);
-
-        return;
-
+    if (models.length === 0) {
+        console.log(`\n${colors.yellow}No models found installed on ${host.name}.${colors.reset}`);
+        const manual = await ask(rl, `${promptPrefix}Model name: `);
+        return manual.trim() || currentModel || null;
     }
 
-
-    console.log(
-        "\nConnecting to TeamGPU..."
-    );
-
-    console.log(
-        `Server: ${SERVER}`
-    );
-
-    console.log(
-        `Model: ${model}`
-    );
-
-    console.log(
-        "\nType /exit to quit."
-    );
-
-    console.log(
-        "Type /clear to clear conversation memory.\n"
-    );
-
-
-    /*
-    ---------------------------------------
-    Conversation memory
-    ---------------------------------------
-    */
-
-    const messages = [];
-
-
-    const rl = createInterface();
-
-
-    try {
-
-        while (true) {
-
-            const prompt =
-                await ask(rl, ">>> ");
-
-
-            /*
-            Ignore empty prompts
-            */
-
-            if (!prompt.trim()) {
-                continue;
-            }
-
-
-            /*
-            ---------------------------------------
-            Exit
-            ---------------------------------------
-            */
-
-            if (
-                prompt.trim() === "/exit" ||
-                prompt.trim() === "/quit"
-            ) {
-
-                break;
-
-            }
-
-
-            /*
-            ---------------------------------------
-            Clear conversation
-            ---------------------------------------
-            */
-
-            if (prompt.trim() === "/clear") {
-
-                messages.length = 0;
-
-                console.log(
-                    "\nConversation cleared.\n"
-                );
-
-                continue;
-
-            }
-
-
-            /*
-            ---------------------------------------
-            Add user message
-            ---------------------------------------
-            */
-
-            messages.push({
-
-                role: "user",
-
-                content: prompt
-
-            });
-
-
-            try {
-
-                /*
-                ---------------------------------------
-                Send entire conversation to Agent
-                ---------------------------------------
-                */
-
-                const response = await fetch(
-                    `${SERVER}/api/generate`,
-                    {
-
-                        method: "POST",
-
-                        headers: {
-                            "Content-Type": "application/json"
-                        },
-
-                        body: JSON.stringify({
-
-                            model,
-
-                            messages,
-
-                            stream: true
-
-                        })
-
-                    }
-                );
-
-
-                /*
-                ---------------------------------------
-                Check response
-                ---------------------------------------
-                */
-
-                if (!response.ok) {
-
-                    console.error(
-                        `\nServer returned ${response.status}`
-                    );
-
-                    console.error(
-                        await response.text()
-                    );
-
-
-                    /*
-                    Remove the user message because
-                    the request failed.
-                    */
-
-                    messages.pop();
-
-                    continue;
-
-                }
-
-
-                process.stdout.write("\n");
-
-
-                /*
-                ---------------------------------------
-                Stream response
-                ---------------------------------------
-                */
-
-                const assistantResponse =
-                    await streamResponse(response);
-
-
-                /*
-                ---------------------------------------
-                Save assistant response
-                ---------------------------------------
-                */
-
-                messages.push({
-
-                    role: "assistant",
-
-                    content: assistantResponse
-
-                });
-
-
-                process.stdout.write("\n\n");
-
-            }
-
-            catch (error) {
-
-                console.error(
-                    `\nFailed to connect to TeamGPU: ${error.message}\n`
-                );
-
-
-                /*
-                Remove failed user message
-                */
-
-                messages.pop();
-
-            }
-
+    const defaultIdx = 1;
+
+    while (true) {
+        const answer = await promptModelInput(rl, host, models);
+        const trimmed = (answer || "").trim();
+
+        if (!trimmed) {
+            if (currentModel) return currentModel;
+            return models[defaultIdx - 1];
         }
 
+        const num = parseInt(trimmed, 10);
+        if (!isNaN(num) && num >= 1 && num <= models.length) {
+            return models[num - 1];
+        }
+
+        if (trimmed.length > 0 && isNaN(num)) {
+            return trimmed;
+        }
+
+        const leftPad = getCardLeftPad();
+        console.log(`\n${leftPad}${colors.red}Invalid selection. Enter a number between 1 and ${models.length}.${colors.reset}`);
+        await new Promise(r => setTimeout(r, 1200));
     }
+}
 
-    finally {
+/**
+ * Main interactive run & chat loop.
+ */
+export async function run(initialModel = null, options = {}) {
+    const rl = createInterface();
+    const directServer = options.server || process.env.TEAMGPU_SERVER || null;
 
+    try {
+        // 1. Host selection (OpenCode Splash)
+        let currentHost = await selectHostPrompt(rl, { directServer });
+        if (!currentHost) {
+            console.log("\nNo host selected. Exiting.");
+            return;
+        }
+
+        // 2. Model selection (OpenCode Model Picker)
+        let currentModel = initialModel;
+        if (!currentModel) {
+            currentModel = await selectModelPrompt(rl, currentHost);
+            if (!currentModel) {
+                console.log("\nNo model selected. Exiting.");
+                return;
+            }
+        }
+
+        // Preflight validation
+        if (currentHost.ollama && !currentHost.ollama.running) {
+            console.log(`\n${colors.yellow}⚠ Warning: Ollama is detected but not currently running on '${currentHost.name}'. Responses may fail.${colors.reset}\n`);
+            await new Promise(r => setTimeout(r, 1500));
+        }
+
+        // 3. OpenCode Split-Pane Chat Interface
+        await runChatInterface({
+            rl,
+            initialHost: currentHost,
+            initialModel: currentModel,
+            selectHostPrompt,
+            selectModelPrompt
+        });
+    } finally {
         rl.close();
-
     }
-
 }
