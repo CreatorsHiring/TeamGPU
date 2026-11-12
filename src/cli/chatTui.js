@@ -3,10 +3,86 @@ import { colors, stripAnsi, getTerminalDimensions } from "./tui.js";
 import { probeHost } from "../discovery/client.js";
 
 /**
- * Word-wraps text to a maximum visible width, preserving manual newlines.
+ * Returns the terminal cell display width of a Unicode code point (0, 1, or 2).
+ */
+export function charDisplayWidth(cp) {
+    if (cp === 0) return 0;
+    if (cp < 32 || (cp >= 0x7f && cp < 0xa0)) return 0;
+    if (
+        (cp >= 0x0300 && cp <= 0x036f) ||
+        (cp >= 0x1ab0 && cp <= 0x1aff) ||
+        (cp >= 0x1dc0 && cp <= 0x1dff) ||
+        (cp >= 0x200b && cp <= 0x200f) ||
+        (cp >= 0x202a && cp <= 0x202e) ||
+        (cp >= 0x20d0 && cp <= 0x20ff) ||
+        (cp >= 0xfe00 && cp <= 0xfe0f) ||
+        (cp >= 0xfe20 && cp <= 0xfe2f)
+    ) {
+        return 0;
+    }
+    if (
+        cp >= 0x1100 && (
+            cp <= 0x115f ||
+            cp === 0x2329 || cp === 0x232a ||
+            (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) ||
+            (cp >= 0xac00 && cp <= 0xd7a3) ||
+            (cp >= 0xf900 && cp <= 0xfaff) ||
+            (cp >= 0xfe10 && cp <= 0xfe19) ||
+            (cp >= 0xfe30 && cp <= 0xfe6f) ||
+            (cp >= 0xff00 && cp <= 0xff60) ||
+            (cp >= 0xffe0 && cp <= 0xffe6) ||
+            (cp >= 0x1f000 && cp <= 0x1fbff) ||
+            (cp >= 0x20000 && cp <= 0x3fffd)
+        )
+    ) {
+        return 2;
+    }
+    return 1;
+}
+
+/**
+ * Computes exact terminal cell width of a string, ignoring ANSI escape sequences.
+ */
+export function getCellWidth(str) {
+    if (!str) return 0;
+    const clean = stripAnsi(String(str));
+    let cells = 0;
+    for (const ch of clean) {
+        cells += charDisplayWidth(ch.codePointAt(0));
+    }
+    return cells;
+}
+
+/**
+ * Splits a single word into chunks that each fit within maxCells terminal cells.
+ */
+function splitWordByCells(word, maxCells) {
+    const chunks = [];
+    let current = "";
+    let currentCells = 0;
+    for (const ch of word) {
+        const w = charDisplayWidth(ch.codePointAt(0));
+        if (current && currentCells + w > maxCells) {
+            chunks.push(current);
+            current = ch;
+            currentCells = w;
+        } else {
+            current += ch;
+            currentCells += w;
+        }
+    }
+    if (current) {
+        chunks.push(current);
+    }
+    return chunks.length > 0 ? chunks : [""];
+}
+
+/**
+ * Word-wraps text to a maximum visible terminal-cell width, preserving manual newlines.
  */
 export function wrapText(text, maxWidth) {
     if (!text) return [""];
+    const limit = Math.max(1, maxWidth);
     const paragraphs = String(text).split("\n");
     const wrappedLines = [];
 
@@ -18,30 +94,37 @@ export function wrapText(text, maxWidth) {
 
         const words = paragraph.split(" ");
         let currentLine = "";
+        let currentCells = 0;
 
         for (const word of words) {
+            const wordCells = getCellWidth(word);
             if (!currentLine) {
-                if (word.length > maxWidth) {
-                    for (let i = 0; i < word.length; i += maxWidth) {
-                        wrappedLines.push(word.slice(i, i + maxWidth));
+                if (wordCells > limit) {
+                    const chunks = splitWordByCells(word, limit);
+                    for (let i = 0; i < chunks.length - 1; i++) {
+                        wrappedLines.push(chunks[i]);
                     }
+                    currentLine = chunks[chunks.length - 1];
+                    currentCells = getCellWidth(currentLine);
                 } else {
                     currentLine = word;
+                    currentCells = wordCells;
                 }
-            } else if (currentLine.length + 1 + word.length <= maxWidth) {
+            } else if (currentCells + 1 + wordCells <= limit) {
                 currentLine += " " + word;
+                currentCells += 1 + wordCells;
             } else {
                 wrappedLines.push(currentLine);
-                if (word.length > maxWidth) {
-                    for (let i = 0; i < word.length; i += maxWidth) {
-                        if (i + maxWidth >= word.length) {
-                            currentLine = word.slice(i);
-                        } else {
-                            wrappedLines.push(word.slice(i, i + maxWidth));
-                        }
+                if (wordCells > limit) {
+                    const chunks = splitWordByCells(word, limit);
+                    for (let i = 0; i < chunks.length - 1; i++) {
+                        wrappedLines.push(chunks[i]);
                     }
+                    currentLine = chunks[chunks.length - 1];
+                    currentCells = getCellWidth(currentLine);
                 } else {
                     currentLine = word;
+                    currentCells = wordCells;
                 }
             }
         }
@@ -54,54 +137,60 @@ export function wrapText(text, maxWidth) {
 }
 
 /**
- * Pads or truncates a string with ANSI codes to an exact visible width.
- * Never cuts through an ANSI escape code.
+ * Pads or truncates a string with ANSI codes to an exact terminal cell width.
+ * Never cuts through an ANSI escape code or splits multi-cell characters.
  */
 export function padToWidth(str, width) {
-    const vis = stripAnsi(str).length;
-    if (vis < width) {
-        return str + " ".repeat(width - vis);
+    const target = Math.max(0, width);
+    const vis = getCellWidth(str);
+    if (vis < target) {
+        return str + " ".repeat(target - vis);
     }
-    if (vis === width) {
+    if (vis === target) {
         return str;
     }
-    // Truncate visible characters while preserving ANSI integrity
-    let count = 0;
+    let cells = 0;
     let result = "";
-    let inAnsi = false;
-    for (let i = 0; i < str.length; i++) {
+    let i = 0;
+    while (i < str.length) {
         if (str[i] === "\x1b") {
-            inAnsi = true;
-            result += str[i];
-        } else if (inAnsi) {
-            result += str[i];
-            if (str[i] === "m") inAnsi = false;
-        } else {
-            if (count >= width) break;
-            result += str[i];
-            count++;
+            const rest = str.slice(i);
+            const m = rest.match(/^\x1b\[[0-9;?]*[a-zA-Z]/);
+            if (m) {
+                result += m[0];
+                i += m[0].length;
+                continue;
+            }
         }
+        const cp = str.codePointAt(i);
+        const ch = String.fromCodePoint(cp);
+        const w = charDisplayWidth(cp);
+        if (cells + w > target) break;
+        result += ch;
+        cells += w;
+        i += ch.length;
+    }
+    if (cells < target) {
+        result += " ".repeat(target - cells);
     }
     return result + colors.reset;
 }
 
 /**
- * Sanitizes and clips plain text to an exact maximum number of visible characters.
+ * Sanitizes and clips plain text to an exact maximum number of terminal cells.
  */
 export function clipToWidth(text, maxWidth) {
     if (!text || maxWidth <= 0) return "";
     const clean = stripAnsi(String(text)).replace(/[\t\r\n]/g, " ");
-    if (clean.length <= maxWidth) return clean;
-    const chars = Array.from(clean);
-    if (chars.length <= maxWidth) return clean;
-    // Slice code points and ensure UTF-16 length does not exceed maxWidth
-    let sliced = chars.slice(0, maxWidth).join("");
-    while (sliced.length > maxWidth && sliced.length > 0) {
-        const arr = Array.from(sliced);
-        arr.pop();
-        sliced = arr.join("");
+    let cells = 0;
+    let out = "";
+    for (const ch of clean) {
+        const w = charDisplayWidth(ch.codePointAt(0));
+        if (cells + w > maxWidth) break;
+        out += ch;
+        cells += w;
     }
-    return sliced;
+    return out;
 }
 
 /**
@@ -113,8 +202,8 @@ export function buildCardPadRow(cardWidth) {
 }
 
 /**
- * Builds an input-card content row with explicit width enforcement and continuous background.
- * Applies reset ONLY after all right-padding spaces have been rendered inside cardBg.
+ * Builds an input-card content row with explicit terminal-cell width enforcement
+ * and continuous background. Applies reset ONLY after all right-padding spaces.
  */
 export function buildCardRow(text, textColor, cardWidth) {
     const safeWidth = Math.max(4, cardWidth);
@@ -122,8 +211,8 @@ export function buildCardRow(text, textColor, cardWidth) {
     const minRightInnerPad = 1;
     const maxTextWidth = Math.max(1, safeWidth - leftInnerPad - minRightInnerPad);
     const clipped = clipToWidth(text, maxTextWidth);
-    const visLen = clipped.length;
-    const rightPad = Math.max(minRightInnerPad, safeWidth - leftInnerPad - visLen);
+    const visCells = getCellWidth(clipped);
+    const rightPad = Math.max(minRightInnerPad, safeWidth - leftInnerPad - visCells);
 
     return ` ${colors.orange}▌${colors.cardBg}${" ".repeat(leftInnerPad)}${textColor}${clipped}${" ".repeat(rightPad)}${colors.reset}`;
 }
@@ -196,11 +285,14 @@ export function formatSidebarLines(host, currentModel, width) {
  */
 export function getChatLayout(cols, rows, inputVal = "") {
     const sidebarWidth = Math.max(22, Math.min(32, Math.floor(cols * 0.26)));
-    const dividerCol = cols - sidebarWidth; // 1-based column for divider
+    const dividerCol = Math.max(2, cols - sidebarWidth); // 1-based column for divider
     const leftWidth = Math.max(1, dividerCol - 1);
     const sidebarStartCol = dividerCol + 1;
     const headerRows = 2; // Rows 1 and 2
-    const cardWidth = Math.max(4, leftWidth - 2);
+
+    // Strict 1-column guard before dividerCol so input card never touches divider or sidebar
+    const safeInputWidth = Math.max(1, leftWidth - 1);
+    const cardWidth = Math.max(4, safeInputWidth - 2);
     const promptMaxWidth = Math.max(1, cardWidth - 4);
 
     const rawWrapped = inputVal ? wrapText(inputVal, promptMaxWidth) : [""];
@@ -221,6 +313,7 @@ export function getChatLayout(cols, rows, inputVal = "") {
         sidebarWidth,
         dividerCol,
         leftWidth,
+        safeInputWidth,
         sidebarStartCol,
         headerRows,
         inputRows,
@@ -341,20 +434,22 @@ export async function runChatInterface({
      * Guarantees the cursor stays inside the shaded input card and never crosses dividerCol.
      */
     const getCursorPos = (layout = getLayout()) => {
-        const safeCardWidth = Math.max(4, Math.min(layout.cardWidth, Math.max(0, layout.leftWidth - 2)));
-        const maxTextWidth = Math.max(1, safeCardWidth - 3);
+        const safeInputWidth = Math.max(1, Math.min(layout.safeInputWidth ?? (layout.leftWidth - 1), layout.leftWidth - 1));
+        const innerCardWidth = Math.max(1, Math.min(layout.cardWidth, Math.max(1, safeInputWidth - 2)));
+        const maxTextWidth = Math.max(1, innerCardWidth - 3);
+        const maxCursorCol = Math.min(layout.leftWidth - 1, safeInputWidth, 2 + innerCardWidth);
         const startRow = layout.rows - layout.inputRows + 1;
 
         if (!inputVal) {
             const cursorRow = Math.max(1, startRow + 1);
-            const cursorCol = Math.min(2 + safeCardWidth, Math.min(layout.leftWidth, 5));
+            const cursorCol = Math.min(maxCursorCol, 5);
             return { cursorRow, cursorCol };
         }
 
         const lines = (layout.visiblePromptLines || [""]).slice(0, Math.max(1, layout.inputContentRows || 1));
         const cursorRow = Math.max(1, startRow + lines.length);
         const clippedLast = clipToWidth(lines[lines.length - 1] || "", maxTextWidth);
-        const cursorCol = Math.min(2 + safeCardWidth, Math.min(layout.leftWidth, 5 + clippedLast.length));
+        const cursorCol = Math.min(maxCursorCol, 5 + getCellWidth(clippedLast));
         return { cursorRow, cursorCol };
     };
 
@@ -392,13 +487,16 @@ export async function runChatInterface({
     };
 
     /**
-     * Renders persistent right-hand system sidebar lines in-place.
+     * Renders persistent right-hand system sidebar lines strictly within sidebar columns.
      */
     const renderSidebar = (layout) => {
-        const sidebarLines = formatSidebarLines(currentHost, currentModel, layout.sidebarWidth);
+        const sidebarWidth = Math.max(1, Math.min(layout.sidebarWidth, layout.cols - layout.sidebarStartCol + 1));
+        const sidebarLines = formatSidebarLines(currentHost, currentModel, sidebarWidth);
         let out = "";
         for (let r = 1; r <= layout.rows; r++) {
-            const line = (r - 1 < sidebarLines.length) ? sidebarLines[r - 1] : " ".repeat(layout.sidebarWidth);
+            const line = (r - 1 < sidebarLines.length)
+                ? padToWidth(sidebarLines[r - 1], sidebarWidth)
+                : " ".repeat(sidebarWidth);
             out += `\x1b[${r};${layout.sidebarStartCol}H${line}`;
         }
         return out;
@@ -432,76 +530,84 @@ export async function runChatInterface({
             displayed = allLines.slice(startIdx, startIdx + layout.convHeight);
         }
 
-        let out = "\x1b[?25l"; // Hide cursor briefly during screen update
+        process.stdout.write("\x1b[?25l\x1b[?7l");
+        try {
+            let out = "";
+            // Update header row 1 & row 2 scroll state
+            out += renderHeader(layout);
 
-        // Update header row 1 & row 2 scroll state
-        out += renderHeader(layout);
-
-        // Write conversation lines into rows convStartRow through convEndRow
-        for (let i = 0; i < layout.convHeight; i++) {
-            const r = layout.convStartRow + i;
-            const line = padToWidth(displayed[i] || "", layout.leftWidth);
-            out += `\x1b[${r};1H${line}`;
+            // Write conversation lines strictly within leftWidth
+            const safeLeftWidth = Math.max(1, Math.min(layout.leftWidth, layout.dividerCol - 1));
+            for (let i = 0; i < layout.convHeight; i++) {
+                const r = layout.convStartRow + i;
+                const line = padToWidth(displayed[i] || "", safeLeftWidth);
+                out += `\x1b[${r};1H${line}`;
+            }
+            process.stdout.write(out);
+        } finally {
+            const { cursorRow, cursorCol } = getCursorPos(layout);
+            process.stdout.write(`\x1b[?7h\x1b[${cursorRow};${cursorCol}H\x1b[?25h`);
         }
-
-        // Return cursor to input position
-        const { cursorRow, cursorCol } = getCursorPos(layout);
-        out += `\x1b[${cursorRow};${cursorCol}H\x1b[?25h`;
-        process.stdout.write(out);
     };
 
     /**
-     * Renders fixed bottom input box lines in-place with strict card width enforcement.
+     * Renders fixed bottom input box lines in-place with strict pane boundaries and DECAWM protection.
      * Every card row keeps cardBg active across all padding spaces before resetting ANSI.
      */
     const renderInputBox = (layout = getLayout()) => {
         if (isExited) return;
 
-        const safeCardWidth = Math.max(4, Math.min(layout.cardWidth, Math.max(0, layout.leftWidth - 2)));
+        const safeInputWidth = Math.max(1, Math.min(layout.safeInputWidth ?? (layout.leftWidth - 1), layout.leftWidth - 1));
+        const innerCardWidth = Math.max(4, Math.min(layout.cardWidth, Math.max(4, safeInputWidth - 2)));
         const targetPromptRows = Math.max(1, layout.inputContentRows || 1);
         const placeholder = "Ask anything... (/models, /hosts, /clear, /exit)";
         const cardLines = [];
 
         // Card Line 1: Top padding
-        cardLines.push(buildCardPadRow(safeCardWidth));
+        cardLines.push(buildCardPadRow(innerCardWidth));
 
         // Card Prompt Lines (explicitly clipped and padded inside cardBg)
         if (!inputVal) {
-            cardLines.push(buildCardRow(placeholder, colors.dim, safeCardWidth));
+            cardLines.push(buildCardRow(placeholder, colors.dim, innerCardWidth));
             for (let i = 1; i < targetPromptRows; i++) {
-                cardLines.push(buildCardRow("", colors.white, safeCardWidth));
+                cardLines.push(buildCardRow("", colors.white, innerCardWidth));
             }
         } else {
             const promptLines = (layout.visiblePromptLines || [""]).slice(0, targetPromptRows);
             for (const line of promptLines) {
-                cardLines.push(buildCardRow(line, colors.white, safeCardWidth));
+                cardLines.push(buildCardRow(line, colors.white, innerCardWidth));
             }
             for (let i = promptLines.length; i < targetPromptRows; i++) {
-                cardLines.push(buildCardRow("", colors.white, safeCardWidth));
+                cardLines.push(buildCardRow("", colors.white, innerCardWidth));
             }
         }
 
         // Card Model Line
-        cardLines.push(buildCardRow(currentModel || "", colors.orange, safeCardWidth));
+        cardLines.push(buildCardRow(currentModel || "", colors.orange, innerCardWidth));
 
         // Card Bottom Padding
-        cardLines.push(buildCardPadRow(safeCardWidth));
+        cardLines.push(buildCardPadRow(innerCardWidth));
 
-        // Hints line below card (explicitly bounded within leftWidth, no ESC[K)
-        const hintMax = Math.max(0, layout.leftWidth - 3);
+        // Hints line below card (explicitly bounded within safeInputWidth, no ESC[K)
+        const hintMax = Math.max(0, safeInputWidth - 3);
         const hintText = clipToWidth("/help for commands", hintMax);
-        const hintPad = Math.max(0, layout.leftWidth - 3 - hintText.length);
+        const hintCells = getCellWidth(hintText);
+        const hintPad = Math.max(0, safeInputWidth - 3 - hintCells);
         cardLines.push(`   ${colors.dim}${hintText}${colors.reset}${" ".repeat(hintPad)}`);
 
-        let out = "\x1b[?25l";
-        for (let i = 0; i < cardLines.length; i++) {
-            const r = layout.rows - layout.inputRows + 1 + i;
-            out += `\x1b[${r};1H${cardLines[i]}`;
+        // Temporarily disable autowrap (DECAWM) while rendering input rows
+        process.stdout.write("\x1b[?25l\x1b[?7l");
+        try {
+            let out = "";
+            for (let i = 0; i < cardLines.length; i++) {
+                const r = layout.rows - layout.inputRows + 1 + i;
+                out += `\x1b[${r};1H${cardLines[i]}`;
+            }
+            process.stdout.write(out);
+        } finally {
+            const { cursorRow, cursorCol } = getCursorPos(layout);
+            process.stdout.write(`\x1b[?7h\x1b[${cursorRow};${cursorCol}H\x1b[?25h`);
         }
-
-        const { cursorRow, cursorCol } = getCursorPos(layout);
-        out += `\x1b[${cursorRow};${cursorCol}H\x1b[?25h`;
-        process.stdout.write(out);
     };
 
     let currentInputRows = 5;
@@ -527,16 +633,20 @@ export async function runChatInterface({
         if (isExited) return;
         const layout = getLayout();
         currentInputRows = layout.inputRows;
-        let out = "\x1b[?25l\x1b[2J\x1b[H"; // Clear entire alternate screen
+        process.stdout.write("\x1b[?25l\x1b[?7l\x1b[2J\x1b[H");
+        try {
+            let out = "";
+            out += renderHeader(layout);
+            out += renderDivider(layout);
+            out += renderSidebar(layout);
+            process.stdout.write(out);
 
-        out += renderHeader(layout);
-        out += renderDivider(layout);
-        out += renderSidebar(layout);
-
-        process.stdout.write(out);
-
-        renderConversation(layout);
-        renderInputBox(layout);
+            renderConversation(layout);
+            renderInputBox(layout);
+        } finally {
+            const { cursorRow, cursorCol } = getCursorPos(layout);
+            process.stdout.write(`\x1b[?7h\x1b[${cursorRow};${cursorCol}H\x1b[?25h`);
+        }
     };
 
     /**
@@ -561,7 +671,7 @@ export async function runChatInterface({
         }
     };
 
-    // Independent background hardware monitor (refreshes sidebar every 4s)
+    // Independent background hardware monitor (refreshes sidebar strictly in sidebar columns every 4s)
     const refreshTimer = setInterval(async () => {
         if (isExited || isStreaming) return;
         try {
@@ -576,9 +686,13 @@ export async function runChatInterface({
         }
         if (!isExited && !isStreaming) {
             const layout = getLayout();
-            const { cursorRow, cursorCol } = getCursorPos(layout);
-            const out = "\x1b[?25l" + renderSidebar(layout) + `\x1b[${cursorRow};${cursorCol}H\x1b[?25h`;
-            process.stdout.write(out);
+            process.stdout.write("\x1b[?25l\x1b[?7l");
+            try {
+                process.stdout.write(renderSidebar(layout));
+            } finally {
+                const { cursorRow, cursorCol } = getCursorPos(layout);
+                process.stdout.write(`\x1b[?7h\x1b[${cursorRow};${cursorCol}H\x1b[?25h`);
+            }
         }
     }, 4000);
 
@@ -596,6 +710,11 @@ export async function runChatInterface({
     // \x1b[?1002h : Enable button-event mouse tracking
     // \x1b[?1006h : Enable SGR mouse mode (extended coordinate reporting)
     process.stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[2J\x1b[H");
+
+    // Detach any existing readline keypress listeners so rl does not echo keystrokes
+    // or call _refreshLine() across the divider into the sidebar while raw TUI is active.
+    const savedRlKeypressListeners = process.stdin.rawListeners("keypress").slice();
+    process.stdin.removeAllListeners("keypress");
 
     if (rl) {
         rl.pause();
@@ -684,6 +803,49 @@ export async function runChatInterface({
     return new Promise((resolve) => {
         let cleanedUp = false;
 
+        const restoreReadlineListeners = () => {
+            for (const fn of savedRlKeypressListeners) {
+                if (!process.stdin.rawListeners("keypress").includes(fn)) {
+                    process.stdin.on("keypress", fn);
+                }
+            }
+        };
+
+        const detachReadlineListeners = () => {
+            for (const fn of savedRlKeypressListeners) {
+                process.stdin.removeListener("keypress", fn);
+            }
+        };
+
+        const suspendChatMode = () => {
+            process.stdout.write("\x1b[?7h\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h");
+            process.stdin.removeListener("keypress", onKey);
+            if (origEmit) {
+                process.stdin.emit = origEmit;
+            }
+            restoreReadlineListeners();
+            if (typeof process.stdin.setRawMode === "function") {
+                process.stdin.setRawMode(false);
+            }
+            if (rl) {
+                rl.resume();
+            }
+        };
+
+        const resumeChatMode = () => {
+            process.stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[2J\x1b[H");
+            detachReadlineListeners();
+            if (rl) {
+                rl.pause();
+            }
+            if (typeof process.stdin.setRawMode === "function") {
+                process.stdin.setRawMode(true);
+            }
+            process.stdin.resume();
+            process.stdin.emit = mouseDataHandler;
+            process.stdin.on("keypress", onKey);
+        };
+
         const cleanup = () => {
             if (cleanedUp) return;
             cleanedUp = true;
@@ -700,18 +862,14 @@ export async function runChatInterface({
             process.removeListener("SIGINT", sigintHandler);
             process.removeListener("exit", exitHandler);
 
-            // Restore original stdin.emit
+            // Restore original stdin.emit and detached readline listeners
             if (origEmit) {
                 process.stdin.emit = origEmit;
             }
+            restoreReadlineListeners();
 
-            // Disable mouse reporting, restore primary screen buffer, show cursor
-            // \x1b[?1006l : Disable SGR mouse mode
-            // \x1b[?1002l : Disable button-event mouse tracking
-            // \x1b[?1000l : Disable normal mouse button reporting
-            // \x1b[?1049l : Restore primary screen buffer (restores original terminal history)
-            // \x1b[?25h   : Ensure cursor is visible
-            process.stdout.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h");
+            // Disable mouse reporting, restore autowrap, restore primary screen buffer, show cursor
+            process.stdout.write("\x1b[?7h\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h");
 
             if (typeof process.stdin.setRawMode === "function") {
                 process.stdin.setRawMode(false);
@@ -816,18 +974,7 @@ export async function runChatInterface({
 
                 // 4. /models or /model
                 if (cmd === "/models" || cmd === "/model") {
-                    // Temporarily leave alternate screen & disable mouse tracking so selection can run cleanly
-                    process.stdout.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h");
-                    process.stdin.removeListener("keypress", onKey);
-                    if (origEmit) {
-                        process.stdin.emit = origEmit;
-                    }
-                    if (typeof process.stdin.setRawMode === "function") {
-                        process.stdin.setRawMode(false);
-                    }
-                    if (rl) {
-                        rl.resume();
-                    }
+                    suspendChatMode();
 
                     const newModel = await selectModelPrompt(rl, currentHost, currentModel);
                     if (newModel && newModel !== currentModel) {
@@ -835,36 +982,14 @@ export async function runChatInterface({
                         messages.push({ role: "system", content: `[Switched active model to ${currentModel}]` });
                     }
 
-                    // Re-enter alternate screen & re-enable mouse tracking
-                    process.stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[2J\x1b[H");
-                    if (rl) {
-                        rl.pause();
-                    }
-                    if (typeof process.stdin.setRawMode === "function") {
-                        process.stdin.setRawMode(true);
-                    }
-                    process.stdin.resume();
-                    process.stdin.emit = mouseDataHandler;
-                    process.stdin.on("keypress", onKey);
-
+                    resumeChatMode();
                     renderFull();
                     return;
                 }
 
                 // 5. /hosts or /host
                 if (cmd === "/hosts" || cmd === "/host") {
-                    // Temporarily leave alternate screen & disable mouse tracking so selection can run cleanly
-                    process.stdout.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h");
-                    process.stdin.removeListener("keypress", onKey);
-                    if (origEmit) {
-                        process.stdin.emit = origEmit;
-                    }
-                    if (typeof process.stdin.setRawMode === "function") {
-                        process.stdin.setRawMode(false);
-                    }
-                    if (rl) {
-                        rl.resume();
-                    }
+                    suspendChatMode();
 
                     const newHost = await selectHostPrompt(rl);
                     if (newHost) {
@@ -875,18 +1000,7 @@ export async function runChatInterface({
                         messages.push({ role: "system", content: `[Connected to ${currentHost.name} (${currentModel})]` });
                     }
 
-                    // Re-enter alternate screen & re-enable mouse tracking
-                    process.stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[2J\x1b[H");
-                    if (rl) {
-                        rl.pause();
-                    }
-                    if (typeof process.stdin.setRawMode === "function") {
-                        process.stdin.setRawMode(true);
-                    }
-                    process.stdin.resume();
-                    process.stdin.emit = mouseDataHandler;
-                    process.stdin.on("keypress", onKey);
-
+                    resumeChatMode();
                     renderFull();
                     return;
                 }
