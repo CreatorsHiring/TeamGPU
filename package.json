@@ -2,13 +2,16 @@
   "name": "teamgpu-agent",
   "version": "0.0.1",
   "type": "module",
-    "bin": {
+  "bin": {
     "teamgpu": "./src/cli/index.js"
   },
   "scripts": {
     "start": "node src/index.js"
   },
   "dependencies": {
-    "express": "^5.2.1"
+    "cli-highlight": "^2.1.11",
+    "express": "^5.2.1",
+    "marked": "^18.2.0",
+    "wrap-ansi": "^10.0.2"
   }
 }

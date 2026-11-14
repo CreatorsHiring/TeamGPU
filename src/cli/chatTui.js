@@ -4,6 +4,7 @@ import { colors, stripAnsi, getTerminalDimensions, openSettingsModalPopup } from
 import { discoverHosts, probeHost } from "../discovery/client.js";
 import { getPreferredMode, setPreferredMode } from "../utils/config.js";
 import { getDeviceIdentity } from "../utils/device.js";
+import { renderMarkdownToLines } from "./markdownRenderer.js";
 
 /**
  * Returns the terminal cell display width of a Unicode code point (0, 1, or 2).
@@ -436,10 +437,19 @@ export function formatConversationLines({
             lines.push(` ${colors.orange}▌${colors.cardBg} ${" ".repeat(Math.max(0, cardWidth - 2))} ${colors.reset}`);
             lines.push("");
         } else if (msg.role === "assistant") {
-            const wrapped = wrapText(msg.content, Math.max(6, leftWidth - 5));
-            for (const line of wrapped) {
-                const col = msg.isError ? colors.red : colors.white;
-                lines.push(`   ${col}${line}${colors.reset}`);
+            if (msg.isError) {
+                const wrapped = wrapText(msg.content, Math.max(6, leftWidth - 5));
+                for (const line of wrapped) {
+                    lines.push(`   ${colors.red}${line}${colors.reset}`);
+                }
+            } else {
+                const rendered = renderMarkdownToLines(msg.content, {
+                    maxWidth: Math.max(10, leftWidth - 2),
+                    isStreaming: false
+                });
+                for (const line of rendered) {
+                    lines.push(line);
+                }
             }
             if (msg.meta) {
                 lines.push("");
@@ -456,9 +466,12 @@ export function formatConversationLines({
     }
 
     if (currentStreamingText) {
-        const wrapped = wrapText(currentStreamingText, Math.max(6, leftWidth - 5));
-        for (const line of wrapped) {
-            lines.push(`   ${colors.white}${line}${colors.reset}`);
+        const rendered = renderMarkdownToLines(currentStreamingText, {
+            maxWidth: Math.max(10, leftWidth - 2),
+            isStreaming: true
+        });
+        for (const line of rendered) {
+            lines.push(line);
         }
     }
 
