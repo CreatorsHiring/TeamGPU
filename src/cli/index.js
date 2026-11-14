@@ -21,6 +21,22 @@ const { _: positional, server } = parseArgs(process.argv);
 const command = positional[0];
 
 switch (command) {
+    case "host": {
+        // Enter temporary Host mode
+        const { startHostMode } = await import("./commands/host.js");
+        await startHostMode();
+        break;
+    }
+
+    case "client": {
+        // Save Client preference persistently and enter Client mode
+        const { setPreferredMode } = await import("../utils/config.js");
+        setPreferredMode("client");
+        const { run } = await import("./commands/run.js");
+        await run(null, { server });
+        break;
+    }
+
     case "run":
     case "chat": {
         const model = positional[1];
@@ -62,9 +78,17 @@ switch (command) {
             break;
         }
 
-        // Default: directly start the host-selection and chat workflow!
-        const { run } = await import("./commands/run.js");
-        await run(null, { server });
+        // Default `teamgpu`: check preferredMode in config
+        const { getPreferredMode } = await import("../utils/config.js");
+        const preferredMode = getPreferredMode();
+
+        if (preferredMode === "client") {
+            const { run } = await import("./commands/run.js");
+            await run(null, { server });
+        } else {
+            const { showOnboarding } = await import("./commands/onboarding.js");
+            await showOnboarding({ server });
+        }
         break;
     }
 }
@@ -74,14 +98,17 @@ function printUsage() {
 TeamGPU CLI - Share & Use GPU Compute across your LAN
 
 Usage:
-  teamgpu                                Launch interactive chat (auto-discovers LAN laptops)
+  teamgpu                                Launch interactive chat (or onboarding on first run)
+  teamgpu client                         Save Client preference and connect to LAN hosts
+  teamgpu host                           Start temporary Host mode (shares GPU on LAN)
   teamgpu run [model] [--server <url>]   Chat with model on host (auto-discovers or uses URL)
   teamgpu devices                        List available TeamGPU host laptops on LAN
   teamgpu models [--server <url>]        List available models on host
   teamgpu status [--server <url>]        Display local & LAN hardware status
   teamgpu help                           Show this help message
 
-In-Chat Commands:
+In-Chat & Selection Commands:
+  /settings                              Open mode settings popup inside host selection
   /models, /model                        Switch the active model on current host
   /hosts, /host                          Switch to a different host laptop on LAN
   /clear                                 Clear conversation history

@@ -1,6 +1,7 @@
 import express from "express";
 import machineRoute from "./routes/machine.js";
 import generateRoute from "./routes/generate.js";
+import heartbeatRoute from "./routes/heartbeat.js";
 import { startHostDiscovery, stopHostDiscovery } from "./discovery/host.js";
 import { getLocalIPs, getDeviceIdentity } from "./utils/device.js";
 
@@ -12,6 +13,8 @@ app.use(express.json());
 
 app.use("/machine", machineRoute);
 app.use("/api/generate", generateRoute);
+app.use("/api/heartbeat", heartbeatRoute);
+app.use("/api/client", heartbeatRoute);
 
 const server = app.listen(PORT, HOST, () => {
     const identity = getDeviceIdentity();

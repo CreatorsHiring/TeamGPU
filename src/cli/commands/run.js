@@ -54,6 +54,9 @@ async function selectHostPrompt(rl, { directServer = null } = {}) {
         }
 
         const answer = await promptHostInput(rl, hosts);
+        if (answer === "__TEAMGPU_SWITCH_TO_HOST__") {
+            return { action: "switch_host" };
+        }
         const trimmed = (answer || "").trim();
 
         if (hosts.length === 0) {
@@ -139,6 +142,12 @@ export async function run(initialModel = null, options = {}) {
         let currentHost = await selectHostPrompt(rl, { directServer });
         if (!currentHost) {
             console.log("\nNo host selected. Exiting.");
+            return;
+        }
+
+        if (currentHost.action === "switch_host") {
+            const { startHostMode } = await import("./host.js");
+            await startHostMode();
             return;
         }
 

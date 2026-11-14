@@ -1,4 +1,5 @@
 import readline from "node:readline";
+import { getPreferredMode, setPreferredMode } from "../utils/config.js";
 
 /**
  * TeamGPU TUI - OpenCode Style Theme
@@ -248,7 +249,8 @@ export function renderSplashComposition({ hosts = [], inputVal = "" } = {}) {
         ? "[r] Retry | [m] Enter URL manually | [q] Quit"
         : `Select host index [1-${hosts.length}] (default 1)...`;
 
-    renderInputCard({ inputVal, placeholder, cardWidth, leftPad });
+    const hint = `${colors.dim}mode selected client /settings to change.${colors.reset}`;
+    renderInputCard({ inputVal, placeholder, cardWidth, leftPad, hint });
 }
 
 /**
@@ -256,7 +258,7 @@ export function renderSplashComposition({ hosts = [], inputVal = "" } = {}) {
  * full-width dark-grey background on all rows, right-aligned hints,
  * and repositions the cursor on the input row.
  */
-export function renderInputCard({ inputVal = "", placeholder = "", cardWidth, leftPad }) {
+export function renderInputCard({ inputVal = "", placeholder = "", cardWidth, leftPad, hint = null }) {
     const cardPadding = Math.max(0, cardWidth - 3);
 
     // Card Line 1 (top padding inside card)
@@ -280,10 +282,11 @@ export function renderInputCard({ inputVal = "", placeholder = "", cardWidth, le
     process.stdout.write(`${leftPad}${colors.orange}▌${colors.cardBg} ${" ".repeat(cardPadding)} ${colors.reset}\n`);
 
     // 5. Keyboard hints below the input card
-    const hint = `${colors.dim}enter select   ctrl+c exit${colors.reset}`;
-    const hintLen = stripAnsi(hint).length;
+    const defaultHint = `${colors.dim}enter select   ctrl+c exit${colors.reset}`;
+    const hintText = hint !== null && hint !== undefined ? hint : defaultHint;
+    const hintLen = stripAnsi(hintText).length;
     const hintPad = " ".repeat(Math.max(2, leftPad.length + cardWidth - hintLen));
-    process.stdout.write(`${hintPad}${hint}`);
+    process.stdout.write(`${hintPad}${hintText}`);
 
     // Reposition cursor directly inside the card on Card Line 2!
     // Hints line has no trailing newline; move up 2 lines (Card Line 3 -> Card Line 2).
@@ -378,6 +381,303 @@ export function renderModelComposition({ host = {}, models = [], inputVal = "" }
 }
 
 /**
+ * Renders the TeamGPU Welcome / Onboarding composition vertically and horizontally centered.
+ *
+ * Structure:
+ * 1. TeamGPU ASCII logo (6 lines)
+ * 2. Spacing (1 line)
+ * 3. "Welcome to TeamGPU" heading (1 line)
+ * 4. "Choose how you want to use TeamGPU:" subheading (1 line)
+ * 5. Spacing (1 line)
+ * 6. Option [1] Host (2 lines: title + description)
+ * 7. Spacing (1 line)
+ * 8. Option [2] Client (2 lines: title + description)
+ * 9. Spacing (1 line)
+ * 10. Selection input card (3 lines: top padding, input line, bottom padding)
+ * 11. Keyboard hints below card (1 line)
+ */
+export function renderOnboardingComposition({ inputVal = "" } = {}) {
+    const { rows, cols } = getTerminalDimensions();
+    const contentLines = 20;
+    const topPad = Math.max(0, Math.floor((rows - contentLines) / 2));
+
+    const cardWidth = getCardWidth(cols);
+    const leftPad = getCardLeftPad(cols);
+
+    console.clear();
+    if (topPad > 0) {
+        process.stdout.write("\n".repeat(topPad));
+    }
+
+    // 1. TeamGPU ASCII logo
+    for (let r = 0; r < TEAM_ASCII.length; r++) {
+        const line = colors.white + TEAM_ASCII[r] + colors.reset + " " + colorFire(GPU_ASCII[r]);
+        console.log(centerText(line, cols));
+    }
+    console.log();
+
+    // 2. Headings
+    console.log(centerText(`${colors.white}${colors.bold}Welcome to TeamGPU${colors.reset}`, cols));
+    console.log(centerText(`${colors.dim}Choose how you want to use TeamGPU:${colors.reset}`, cols));
+    console.log();
+
+    // 3. Options
+    const optLeftPad = leftPad + "  ";
+    console.log(`${optLeftPad}${colors.yellow}[1]${colors.reset} ${colors.white}${colors.bold}Host${colors.reset}`);
+    console.log(`${optLeftPad}${colors.dim}    Share your machine's GPU with the TeamGPU network.${colors.reset}`);
+    console.log();
+    console.log(`${optLeftPad}${colors.yellow}[2]${colors.reset} ${colors.white}${colors.bold}Client${colors.reset}`);
+    console.log(`${optLeftPad}${colors.dim}    Discover available GPUs and run workloads remotely.${colors.reset}`);
+    console.log();
+
+    // 4. Selection input card
+    const placeholder = "Select an option [1-2] (default 2)...";
+    renderInputCard({ inputVal, placeholder, cardWidth, leftPad });
+}
+
+/**
+ * Handles interactive onboarding selection.
+ */
+export function promptOnboardingInput(rl = null) {
+    return promptSelectionInput({
+        render: (inputVal) => renderOnboardingComposition({ inputVal }),
+        defaultVal: "2",
+        rl,
+        allowSettings: false
+    });
+}
+
+/**
+ * Opens the in-place Settings modal popup over the current screen.
+ * Displays preferred mode selection (Client vs Host) with exact visual styling,
+ * keyboard arrow navigation, mouse hover/click, and Esc dismissal.
+ */
+export function openSettingsModalPopup({ initialSavedMode = null, onSelect, onClose }) {
+    let selectedIndex = initialSavedMode === "host" ? 1 : 0; // 0 = client, 1 = host
+    let isClosed = false;
+
+    const modalBg = "\x1b[48;2;24;25;32m";
+    const hoverBg = "\x1b[48;2;255;168;108m";
+    const hoverFg = "\x1b[1;38;2;20;20;24m";
+    const hoverMetaFg = "\x1b[22;38;2;65;50;35m";
+    const normalMetaFg = "\x1b[22;2;37m";
+    const whiteFg = "\x1b[1;97m";
+    const orangeFg = "\x1b[1;38;2;255;125;0m";
+
+    const getPopupGeometry = () => {
+        const { rows, cols } = getTerminalDimensions();
+        const popupWidth = Math.max(56, Math.min(68, cols - 6));
+        const leftCol = Math.max(2, Math.floor((cols - popupWidth) / 2) + 1);
+        const rightCol = leftCol + popupWidth - 1;
+        const innerWidth = popupWidth - 4;
+        const totalHeight = 13;
+        const topRow = Math.max(2, Math.floor((rows - totalHeight) / 2) + 1);
+        const bottomRow = topRow + totalHeight - 1;
+        return { rows, cols, popupWidth, leftCol, rightCol, innerWidth, totalHeight, topRow, bottomRow };
+    };
+
+    const renderPopup = () => {
+        if (isClosed) return;
+        const geom = getPopupGeometry();
+        const makeRow = (content, contentCells) => {
+            const pad = Math.max(0, geom.innerWidth - contentCells);
+            return `${modalBg}  ${content}${modalBg}${" ".repeat(pad)}  ${colors.reset}`;
+        };
+
+        const rowsOut = [];
+        // Line 0: Top padding
+        rowsOut.push(`${modalBg}${" ".repeat(geom.popupWidth)}${colors.reset}`);
+
+        // Line 1: Header
+        const title = "Settings";
+        const rightText = "TEAMGPU · esc";
+        const titleGap = Math.max(1, geom.innerWidth - stripAnsi(title).length - stripAnsi(rightText).length);
+        rowsOut.push(makeRow(
+            `${whiteFg}${title}${" ".repeat(titleGap)}${normalMetaFg}${rightText}`,
+            stripAnsi(title).length + titleGap + stripAnsi(rightText).length
+        ));
+
+        // Line 2: Gap
+        rowsOut.push(`${modalBg}${" ".repeat(geom.popupWidth)}${colors.reset}`);
+
+        // Line 3: Subheading
+        const subhead = "Select your preferred mode";
+        rowsOut.push(makeRow(`${normalMetaFg}${subhead}`, stripAnsi(subhead).length));
+
+        // Line 4: Gap
+        rowsOut.push(`${modalBg}${" ".repeat(geom.popupWidth)}${colors.reset}`);
+
+        // Line 5: Option 0 (Client) Title
+        const isClientHovered = selectedIndex === 0;
+        const isClientActive = initialSavedMode === "client";
+        const clientBg = isClientHovered ? hoverBg : modalBg;
+        const clientBullet = isClientActive ? "● " : "  ";
+        const clientBulletFg = isClientHovered ? hoverFg : (isClientActive ? orangeFg : "");
+        const clientTitleFg = isClientHovered ? hoverFg : (isClientActive ? orangeFg : whiteFg);
+        const clientTitleStr = `${clientBulletFg}${clientBullet}${clientTitleFg}Client`;
+        const clientPad1 = Math.max(0, geom.innerWidth - 6);
+        rowsOut.push(`${clientBg}  ${clientTitleStr}${" ".repeat(clientPad1)}  ${colors.reset}`);
+
+        // Line 6: Option 0 (Client) Description
+        const clientDesc = "Discover available GPUs and run workloads remotely.";
+        const clientDescFg = isClientHovered ? hoverMetaFg : normalMetaFg;
+        const clientPad2 = Math.max(0, geom.innerWidth - 4 - stripAnsi(clientDesc).length);
+        rowsOut.push(`${clientBg}      ${clientDescFg}${clientDesc}${" ".repeat(clientPad2)}  ${colors.reset}`);
+
+        // Line 7: Gap between options
+        rowsOut.push(`${modalBg}${" ".repeat(geom.popupWidth)}${colors.reset}`);
+
+        // Line 8: Option 1 (Host) Title
+        const isHostHovered = selectedIndex === 1;
+        const isHostActive = initialSavedMode === "host";
+        const hostBg = isHostHovered ? hoverBg : modalBg;
+        const hostBullet = isHostActive ? "● " : "  ";
+        const hostBulletFg = isHostHovered ? hoverFg : (isHostActive ? orangeFg : "");
+        const hostTitleFg = isHostHovered ? hoverFg : (isHostActive ? orangeFg : whiteFg);
+        const hostTitleStr = `${hostBulletFg}${hostBullet}${hostTitleFg}Host`;
+        const hostPad1 = Math.max(0, geom.innerWidth - 6);
+        rowsOut.push(`${hostBg}  ${hostTitleStr}${" ".repeat(hostPad1)}  ${colors.reset}`);
+
+        // Line 9: Option 1 (Host) Description
+        const hostDesc = "Share your machine's GPU with the TeamGPU network.";
+        const hostDescFg = isHostHovered ? hoverMetaFg : normalMetaFg;
+        const hostPad2 = Math.max(0, geom.innerWidth - 4 - stripAnsi(hostDesc).length);
+        rowsOut.push(`${hostBg}      ${hostDescFg}${hostDesc}${" ".repeat(hostPad2)}  ${colors.reset}`);
+
+        // Line 10: Gap
+        rowsOut.push(`${modalBg}${" ".repeat(geom.popupWidth)}${colors.reset}`);
+
+        // Line 11: Footer
+        const footerText = "↑/↓ navigate     enter select     esc close";
+        rowsOut.push(makeRow(`${normalMetaFg}${footerText}`, stripAnsi(footerText).length));
+
+        // Line 12: Bottom padding
+        rowsOut.push(`${modalBg}${" ".repeat(geom.popupWidth)}${colors.reset}`);
+
+        // Render rows using ANSI positioning
+        process.stdout.write("\x1b[?25l\x1b[?7l");
+        let out = "";
+        for (let i = 0; i < rowsOut.length; i++) {
+            const r = geom.topRow + i;
+            out += `\x1b[${r}H\x1b[${geom.leftCol}G${rowsOut[i]}`;
+        }
+        process.stdout.write(out);
+    };
+
+    // Initial render
+    renderPopup();
+
+    // Enable SGR mouse tracking
+    process.stdout.write("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+
+    const close = () => {
+        if (isClosed) return;
+        isClosed = true;
+        // Disable mouse tracking and restore cursor
+        process.stdout.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?7h");
+        process.stdin.removeListener("data", onRawData);
+    };
+
+    const choose = (idx) => {
+        close();
+        const mode = idx === 0 ? "client" : "host";
+        if (onSelect) onSelect(mode);
+    };
+
+    const dismiss = () => {
+        close();
+        if (onClose) onClose();
+    };
+
+    const onKey = (str, key) => {
+        if (isClosed) return;
+        if (!key && str === "\x1b") {
+            dismiss();
+            return;
+        }
+        if (key) {
+            if (key.name === "escape") {
+                dismiss();
+                return;
+            }
+            if (key.name === "up" || key.name === "down") {
+                selectedIndex = selectedIndex === 0 ? 1 : 0;
+                renderPopup();
+                return;
+            }
+            if (key.name === "return" || key.name === "enter") {
+                choose(selectedIndex);
+                return;
+            }
+        }
+    };
+
+    const onRawData = (chunk) => {
+        if (isClosed) return;
+        const text = chunk.toString();
+        // Check for Esc key in raw chunk
+        if (text === "\x1b" || text === "\x1b\x1b") {
+            dismiss();
+            return;
+        }
+
+        // SGR Mouse regex: \x1b[<btn;col;row;M or m
+        const sgrRe = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
+        let match;
+        while ((match = sgrRe.exec(text)) !== null) {
+            const btn = parseInt(match[1], 10);
+            const col = parseInt(match[2], 10);
+            const row = parseInt(match[3], 10);
+            const type = match[4]; // M = press / drag / motion, m = release
+
+            const geom = getPopupGeometry();
+            const isInside = (col >= geom.leftCol && col <= geom.rightCol && row >= geom.topRow && row <= geom.bottomRow);
+
+            if (type === "M") {
+                if (btn === 0) { // Left click
+                    if (!isInside) {
+                        dismiss();
+                        return;
+                    }
+                    // Option 0 (Client): rows topRow + 5 and topRow + 6
+                    if (row === geom.topRow + 5 || row === geom.topRow + 6) {
+                        choose(0);
+                        return;
+                    }
+                    // Option 1 (Host): rows topRow + 8 and topRow + 9
+                    if (row === geom.topRow + 8 || row === geom.topRow + 9) {
+                        choose(1);
+                        return;
+                    }
+                } else if (btn === 35 || btn === 32) { // Mouse move / hover
+                    if (isInside) {
+                        if (row === geom.topRow + 5 || row === geom.topRow + 6) {
+                            if (selectedIndex !== 0) {
+                                selectedIndex = 0;
+                                renderPopup();
+                            }
+                        } else if (row === geom.topRow + 8 || row === geom.topRow + 9) {
+                            if (selectedIndex !== 1) {
+                                selectedIndex = 1;
+                                renderPopup();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    process.stdin.on("data", onRawData);
+
+    return {
+        onKey,
+        render: renderPopup,
+        close: dismiss
+    };
+}
+
+/**
  * Shared interactive input loop for selection screens (host and model selection).
  * - Full-width dark-grey background on all 3 rows
  * - Cursor positioned on the input row
@@ -385,10 +685,14 @@ export function renderModelComposition({ host = {}, models = [], inputVal = "" }
  * - Re-renders dynamically on terminal resize
  * - Enter defaults to defaultVal
  * - Clean Ctrl+C exit
+ * - In-place Settings popup overlay when /settings is entered
  */
-export function promptSelectionInput({ render, defaultVal = "1", rl = null }) {
+export function promptSelectionInput({ render, defaultVal = "1", rl = null, allowSettings = false }) {
     return new Promise((resolve) => {
         let inputVal = "";
+        let activePopup = null;
+        let isExited = false;
+        let settingsDebounceTimer = null;
 
         const isTTY = Boolean(process.stdin.isTTY && typeof process.stdin.setRawMode === "function");
 
@@ -422,18 +726,65 @@ export function promptSelectionInput({ render, defaultVal = "1", rl = null }) {
         render(inputVal);
 
         const onResize = () => {
-            render(inputVal);
+            if (activePopup) {
+                render(inputVal);
+                activePopup.render();
+            } else {
+                render(inputVal);
+            }
         };
         process.stdout.on("resize", onResize);
 
+        const triggerSettingsPopup = () => {
+            if (activePopup || isExited) return;
+            const preferred = getPreferredMode();
+            activePopup = openSettingsModalPopup({
+                initialSavedMode: preferred,
+                onClose: () => {
+                    activePopup = null;
+                    inputVal = "";
+                    render(inputVal);
+                },
+                onSelect: (chosenMode) => {
+                    activePopup = null;
+                    if (chosenMode === "client") {
+                        setPreferredMode("client");
+                        inputVal = "";
+                        render(inputVal);
+                    } else if (chosenMode === "host") {
+                        cleanup();
+                        resolve("__TEAMGPU_SWITCH_TO_HOST__");
+                    }
+                }
+            });
+        };
+
         const onKey = (str, key) => {
             if (key && key.ctrl && key.name === "c") {
+                if (activePopup) {
+                    activePopup.close();
+                    activePopup = null;
+                }
                 cleanup();
                 process.stdout.write("\x1b[2B\r\n\x1b[?25h");
                 process.exit(0);
             }
 
+            // Route keypresses to active modal popup if open
+            if (activePopup) {
+                activePopup.onKey(str, key);
+                return;
+            }
+
             if (key && (key.name === "return" || key.name === "enter")) {
+                if (settingsDebounceTimer) {
+                    clearTimeout(settingsDebounceTimer);
+                    settingsDebounceTimer = null;
+                }
+                if (allowSettings && inputVal.trim().toLowerCase() === "/settings") {
+                    triggerSettingsPopup();
+                    return;
+                }
                 cleanup();
                 process.stdout.write("\x1b[2B\r\n");
                 resolve(inputVal.trim() || defaultVal);
@@ -441,6 +792,10 @@ export function promptSelectionInput({ render, defaultVal = "1", rl = null }) {
             }
 
             if (key && (key.name === "backspace" || key.name === "delete")) {
+                if (settingsDebounceTimer) {
+                    clearTimeout(settingsDebounceTimer);
+                    settingsDebounceTimer = null;
+                }
                 if (inputVal.length > 0) {
                     inputVal = inputVal.slice(0, -1);
                     render(inputVal);
@@ -451,10 +806,24 @@ export function promptSelectionInput({ render, defaultVal = "1", rl = null }) {
             if (str && str.length === 1 && !key.ctrl && !key.meta) {
                 inputVal += str;
                 render(inputVal);
+
+                if (allowSettings && inputVal.trim().toLowerCase() === "/settings") {
+                    if (settingsDebounceTimer) clearTimeout(settingsDebounceTimer);
+                    settingsDebounceTimer = setTimeout(() => {
+                        if (!activePopup && inputVal.trim().toLowerCase() === "/settings") {
+                            triggerSettingsPopup();
+                        }
+                    }, 800);
+                }
             }
         };
 
         function cleanup() {
+            isExited = true;
+            if (settingsDebounceTimer) {
+                clearTimeout(settingsDebounceTimer);
+                settingsDebounceTimer = null;
+            }
             process.stdout.removeListener("resize", onResize);
             process.stdin.removeListener("keypress", onKey);
             if (typeof process.stdin.setRawMode === "function") {
@@ -478,6 +847,7 @@ export function promptSelectionInput({ render, defaultVal = "1", rl = null }) {
  * - Enter without input defaults to "1"
  * - Ctrl+C exits cleanly
  * - Handles terminal resizing dynamically
+ * - Allows /settings command to open in-place Settings popup
  */
 export function promptHostInput(rlOrHosts, maybeHosts = []) {
     let rl = null;
@@ -494,7 +864,8 @@ export function promptHostInput(rlOrHosts, maybeHosts = []) {
     return promptSelectionInput({
         render: (inputVal) => renderSplashComposition({ hosts, inputVal }),
         defaultVal,
-        rl
+        rl,
+        allowSettings: true
     });
 }
 

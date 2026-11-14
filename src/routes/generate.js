@@ -1,4 +1,5 @@
 import express from "express";
+import { registerHeartbeat } from "../utils/clientTracker.js";
 
 const router = express.Router();
 
@@ -13,7 +14,16 @@ router.post("/", async (req, res) => {
 
     try {
 
-        const { model, messages } = req.body;
+        const { model, messages, clientId, clientName } = req.body;
+
+        // Register or refresh active client heartbeat
+        const effectiveClientId = clientId || req.headers["x-client-id"];
+        if (effectiveClientId) {
+            registerHeartbeat(effectiveClientId, {
+                name: clientName || req.headers["x-client-name"] || "Client",
+                ip: req.ip || req.socket?.remoteAddress
+            });
+        }
 
         // Validate model
         if (!model) {

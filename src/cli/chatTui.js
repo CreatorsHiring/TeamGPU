@@ -1,6 +1,9 @@
 import readline from "node:readline";
-import { colors, stripAnsi, getTerminalDimensions } from "./tui.js";
-import { probeHost } from "../discovery/client.js";
+import { spawn, execSync } from "node:child_process";
+import { colors, stripAnsi, getTerminalDimensions, openSettingsModalPopup } from "./tui.js";
+import { discoverHosts, probeHost } from "../discovery/client.js";
+import { getPreferredMode, setPreferredMode } from "../utils/config.js";
+import { getDeviceIdentity } from "../utils/device.js";
 
 /**
  * Returns the terminal cell display width of a Unicode code point (0, 1, or 2).
@@ -205,7 +208,7 @@ export function buildCardPadRow(cardWidth) {
  * Builds an input-card content row with explicit terminal-cell width enforcement
  * and continuous background. Applies reset ONLY after all right-padding spaces.
  */
-export function buildCardRow(text, textColor, cardWidth) {
+export function buildCardRow(text, textColor, cardWidth, selStartInLine = 0, selEndInLine = 0) {
     const safeWidth = Math.max(4, cardWidth);
     const leftInnerPad = 2;
     const minRightInnerPad = 1;
@@ -214,7 +217,18 @@ export function buildCardRow(text, textColor, cardWidth) {
     const visCells = getCellWidth(clipped);
     const rightPad = Math.max(minRightInnerPad, safeWidth - leftInnerPad - visCells);
 
-    return ` ${colors.orange}▌${colors.cardBg}${" ".repeat(leftInnerPad)}${textColor}${clipped}${" ".repeat(rightPad)}${colors.reset}`;
+    const s0 = Math.max(0, Math.min(clipped.length, selStartInLine));
+    const s1 = Math.max(0, Math.min(clipped.length, selEndInLine));
+    let renderedText = `${textColor}${clipped}`;
+    if (s0 < s1) {
+        const before = clipped.slice(0, s0);
+        const selected = clipped.slice(s0, s1);
+        const after = clipped.slice(s1);
+        const selStyle = "\x1b[48;2;255;168;108m\x1b[1;38;2;20;20;24m";
+        renderedText = `${textColor}${before}${selStyle}${selected}\x1b[22m${colors.cardBg}${textColor}${after}`;
+    }
+
+    return ` ${colors.orange}▌${colors.cardBg}${" ".repeat(leftInnerPad)}${renderedText}${" ".repeat(rightPad)}${colors.reset}`;
 }
 
 /**
@@ -318,12 +332,83 @@ export function getChatLayout(cols, rows, inputVal = "") {
         headerRows,
         inputRows,
         inputContentRows,
+        wrappedPrompt,
         visiblePromptLines,
         convStartRow,
         convEndRow,
         convHeight,
         cardWidth
     };
+}
+
+/**
+ * Computes exact { line, start, end } character ranges in inputVal for each wrapped line.
+ */
+export function getWrappedLineRanges(inputVal, lines) {
+    const ranges = [];
+    let pos = 0;
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const idx = line ? inputVal.indexOf(line, pos) : pos;
+        const start = idx !== -1 ? idx : pos;
+        const end = start + line.length;
+        ranges.push({ line, start, end });
+        pos = end;
+        if (pos < inputVal.length && (inputVal[pos] === " " || inputVal[pos] === "\n")) {
+            pos++;
+        }
+    }
+    return ranges;
+}
+
+/**
+ * Maps a flat character index in inputVal to { lineIndex, charOffset, lineStart } within wrapped lines.
+ */
+export function locateCursorInWrapped(inputVal, lines, cursorIndex) {
+    const ranges = getWrappedLineRanges(inputVal, lines);
+    for (let i = 0; i < ranges.length; i++) {
+        const { line, start, end } = ranges[i];
+        if (cursorIndex <= end || i === ranges.length - 1) {
+            const offsetInLine = Math.max(0, Math.min(line.length, cursorIndex - start));
+            return { lineIndex: i, charOffset: offsetInLine, lineStart: start };
+        }
+    }
+    const lastIdx = Math.max(0, lines.length - 1);
+    return { lineIndex: lastIdx, charOffset: (lines[lastIdx] || "").length, lineStart: 0 };
+}
+
+function copyToClipboard(text) {
+    if (!text) return;
+    try {
+        if (process.platform === "win32") {
+            const proc = spawn("clip", [], { stdio: ["pipe", "ignore", "ignore"] });
+            proc.stdin.end(text);
+        } else if (process.platform === "darwin") {
+            const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
+            proc.stdin.end(text);
+        } else {
+            const proc = spawn("xclip", ["-selection", "clipboard"], { stdio: ["pipe", "ignore", "ignore"] });
+            proc.on("error", () => {});
+            proc.stdin.end(text);
+        }
+    } catch {
+        // ignore clipboard binary failures; internalClipboard still works
+    }
+}
+
+function readFromClipboard(fallback = "") {
+    try {
+        if (process.platform === "win32") {
+            const out = execSync("powershell -NoProfile -Command Get-Clipboard", { encoding: "utf-8", timeout: 1000 });
+            return out ? out.replace(/\r?\n$/, "") : fallback;
+        }
+        if (process.platform === "darwin") {
+            return execSync("pbpaste", { encoding: "utf-8", timeout: 1000 });
+        }
+        return execSync("xclip -selection clipboard -o", { encoding: "utf-8", timeout: 1000 });
+    } catch {
+        return fallback;
+    }
 }
 
 /**
@@ -399,6 +484,18 @@ export async function runChatInterface({
     const messages = [];
     let currentStreamingText = "";
     let inputVal = "";
+    let cursorIndex = 0;
+    let selectionAnchor = null;
+    let isDraggingSelection = false;
+    let internalClipboard = "";
+
+    const getSelectionRange = () => {
+        if (selectionAnchor === null || selectionAnchor === cursorIndex) return null;
+        return [
+            Math.min(selectionAnchor, cursorIndex),
+            Math.max(selectionAnchor, cursorIndex)
+        ];
+    };
     let scrollOffset = 0;
     let isStreaming = false;
     let isExited = false;
@@ -407,6 +504,44 @@ export async function runChatInterface({
     const STREAM_RENDER_INTERVAL_MS = 33;
     let streamRenderTimer = null;
     let lastStreamRenderTime = 0;
+
+    // Client tracking & heartbeat
+    const clientIdentity = getDeviceIdentity();
+    let heartbeatTimer = null;
+
+    const sendHeartbeat = (targetHost = currentHost) => {
+        if (!targetHost?.url || isExited) return;
+        fetch(`${targetHost.url}/api/heartbeat`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "x-client-id": clientIdentity.id
+            },
+            body: JSON.stringify({
+                clientId: clientIdentity.id,
+                name: clientIdentity.name
+            }),
+            signal: AbortSignal.timeout(2000)
+        }).catch(() => {});
+    };
+
+    const sendDisconnect = (targetHost = currentHost) => {
+        if (!targetHost?.url) return;
+        fetch(`${targetHost.url}/api/client/disconnect`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "x-client-id": clientIdentity.id
+            },
+            body: JSON.stringify({
+                clientId: clientIdentity.id
+            }),
+            signal: AbortSignal.timeout(1000)
+        }).catch(() => {});
+    };
+
+    sendHeartbeat(currentHost);
+    heartbeatTimer = setInterval(() => sendHeartbeat(currentHost), 3000);
 
     /**
      * Obtains latest terminal dimensions and computed layout.
@@ -431,7 +566,7 @@ export async function runChatInterface({
 
     /**
      * Computes the cursor position within the dynamic bottom input card.
-     * Guarantees the cursor stays inside the shaded input card and never crosses dividerCol.
+     * Supports arbitrary cursor placement inside wrapped lines and never crosses dividerCol.
      */
     const getCursorPos = (layout = getLayout()) => {
         const safeInputWidth = Math.max(1, Math.min(layout.safeInputWidth ?? (layout.leftWidth - 1), layout.leftWidth - 1));
@@ -446,10 +581,16 @@ export async function runChatInterface({
             return { cursorRow, cursorCol };
         }
 
-        const lines = (layout.visiblePromptLines || [""]).slice(0, Math.max(1, layout.inputContentRows || 1));
-        const cursorRow = Math.max(1, startRow + lines.length);
-        const clippedLast = clipToWidth(lines[lines.length - 1] || "", maxTextWidth);
-        const cursorCol = Math.min(maxCursorCol, 5 + getCellWidth(clippedLast));
+        const wrappedAll = layout.wrappedPrompt || layout.visiblePromptLines || [""];
+        const visibleLines = (layout.visiblePromptLines || [""]).slice(0, Math.max(1, layout.inputContentRows || 1));
+        const sliceStart = Math.max(0, wrappedAll.length - visibleLines.length);
+        const { lineIndex, charOffset } = locateCursorInWrapped(inputVal, wrappedAll, cursorIndex);
+        const visibleIdx = Math.max(0, Math.min(visibleLines.length - 1, lineIndex - sliceStart));
+
+        const cursorRow = Math.max(1, startRow + 1 + visibleIdx);
+        const beforeCursor = (visibleLines[visibleIdx] || "").slice(0, charOffset);
+        const clippedBefore = clipToWidth(beforeCursor, maxTextWidth);
+        const cursorCol = Math.min(maxCursorCol, 5 + getCellWidth(clippedBefore));
         return { cursorRow, cursorCol };
     };
 
@@ -566,16 +707,24 @@ export async function runChatInterface({
         // Card Line 1: Top padding
         cardLines.push(buildCardPadRow(innerCardWidth));
 
-        // Card Prompt Lines (explicitly clipped and padded inside cardBg)
+        // Card Prompt Lines (explicitly clipped and padded inside cardBg, with selection highlight)
         if (!inputVal) {
             cardLines.push(buildCardRow(placeholder, colors.dim, innerCardWidth));
             for (let i = 1; i < targetPromptRows; i++) {
                 cardLines.push(buildCardRow("", colors.white, innerCardWidth));
             }
         } else {
+            const sel = getSelectionRange();
+            const wrappedAll = layout.wrappedPrompt || layout.visiblePromptLines || [""];
             const promptLines = (layout.visiblePromptLines || [""]).slice(0, targetPromptRows);
-            for (const line of promptLines) {
-                cardLines.push(buildCardRow(line, colors.white, innerCardWidth));
+            const allRanges = getWrappedLineRanges(inputVal, wrappedAll);
+            const visibleRanges = allRanges.slice(-promptLines.length);
+
+            for (let i = 0; i < promptLines.length; i++) {
+                const range = visibleRanges[i] || { line: promptLines[i], start: 0, end: promptLines[i].length };
+                const sel0 = sel ? Math.max(0, sel[0] - range.start) : 0;
+                const sel1 = sel ? Math.max(0, Math.min(promptLines[i].length, sel[1] - range.start)) : 0;
+                cardLines.push(buildCardRow(promptLines[i], colors.white, innerCardWidth, sel0, sel1));
             }
             for (let i = promptLines.length; i < targetPromptRows; i++) {
                 cardLines.push(buildCardRow("", colors.white, innerCardWidth));
@@ -671,9 +820,11 @@ export async function runChatInterface({
         }
     };
 
+    let activePopup = null;
+
     // Independent background hardware monitor (refreshes sidebar strictly in sidebar columns every 4s)
     const refreshTimer = setInterval(async () => {
-        if (isExited || isStreaming) return;
+        if (isExited || isStreaming || activePopup) return;
         try {
             const fresh = await probeHost(currentHost.url, 2000);
             if (fresh) {
@@ -684,7 +835,7 @@ export async function runChatInterface({
         } catch {
             currentHost.online = false;
         }
-        if (!isExited && !isStreaming) {
+        if (!isExited && !isStreaming && !activePopup) {
             const layout = getLayout();
             process.stdout.write("\x1b[?25l\x1b[?7l");
             try {
@@ -709,7 +860,9 @@ export async function runChatInterface({
     // \x1b[?1000h : Enable normal mouse button reporting
     // \x1b[?1002h : Enable button-event mouse tracking
     // \x1b[?1006h : Enable SGR mouse mode (extended coordinate reporting)
-    process.stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[2J\x1b[H");
+    // \x1b[1 q          : Blinking bold block cursor
+    // \x1b]12;#ffffff\x07: Pure white cursor color
+    process.stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[1 q\x1b]12;#ffffff\x07\x1b[2J\x1b[H");
 
     // Detach any existing readline keypress listeners so rl does not echo keystrokes
     // or call _refreshLine() across the divider into the sidebar while raw TUI is active.
@@ -731,7 +884,38 @@ export async function runChatInterface({
     let mousePartialBuffer = "";
     const origEmit = process.stdin.emit.bind(process.stdin);
 
-    const handleMouseWheel = (btn) => {
+    const locateCharFromMouse = (layout, col, row) => {
+        if (!inputVal) return 0;
+        const promptStartRow = layout.rows - layout.inputRows + 2;
+        const wrappedAll = layout.wrappedPrompt || layout.visiblePromptLines || [""];
+        const visibleLines = (layout.visiblePromptLines || [""]).slice(0, Math.max(1, layout.inputContentRows || 1));
+        const allRanges = getWrappedLineRanges(inputVal, wrappedAll);
+        const visibleRanges = allRanges.slice(-visibleLines.length);
+
+        const clampedVisIdx = Math.max(0, Math.min(visibleRanges.length - 1, row - promptStartRow));
+        const range = visibleRanges[clampedVisIdx];
+        if (!range) return inputVal.length;
+
+        if (row < promptStartRow) return range.start;
+        if (row >= promptStartRow + visibleLines.length) return range.end;
+
+        const targetCell = Math.max(0, col - 5);
+        let cells = 0;
+        let charCount = 0;
+        for (const ch of range.line) {
+            const w = charDisplayWidth(ch.codePointAt(0));
+            if (cells + w / 2 >= targetCell) break;
+            cells += w;
+            charCount += ch.length;
+        }
+        return Math.max(0, Math.min(inputVal.length, range.start + charCount));
+    };
+
+    const handleMouseEvent = ({ btn, col, row, action }) => {
+        if (activePopup) {
+            activePopup.onMouse({ btn, col, row, action });
+            return;
+        }
         if ((btn & 64) !== 0) {
             const layout = getLayout();
             const maxScroll = getMaxScroll(layout);
@@ -745,6 +929,46 @@ export async function runChatInterface({
                 scrollOffset = Math.max(0, scrollOffset - 3);
                 renderConversation(layout);
             }
+            return;
+        }
+
+        const layout = getLayout();
+        const inputStartRow = layout.rows - layout.inputRows + 1;
+        const inputEndRow = layout.rows - 1;
+
+        // Left mouse press inside input card -> place cursor & start selection
+        if (btn === 0 && action === "M") {
+            if (col <= layout.leftWidth && row >= inputStartRow && row <= inputEndRow) {
+                const idx = locateCharFromMouse(layout, col, row);
+                selectionAnchor = idx;
+                cursorIndex = idx;
+                isDraggingSelection = true;
+                renderInputBox(layout);
+            } else if (selectionAnchor !== null) {
+                selectionAnchor = null;
+                isDraggingSelection = false;
+                renderInputBox(layout);
+            }
+            return;
+        }
+
+        // Mouse drag with left button held -> extend selection across input text
+        if (isDraggingSelection && (btn & 32) !== 0) {
+            const idx = locateCharFromMouse(layout, col, row);
+            if (idx !== cursorIndex) {
+                cursorIndex = idx;
+                renderInputBox(layout);
+            }
+            return;
+        }
+
+        // Mouse button release -> finalize selection
+        if (action === "m" && isDraggingSelection) {
+            isDraggingSelection = false;
+            if (selectionAnchor === cursorIndex) {
+                selectionAnchor = null;
+            }
+            renderInputBox(layout);
         }
     };
 
@@ -762,21 +986,26 @@ export async function runChatInterface({
             while ((match = sgrRegex.exec(str)) !== null) {
                 hasMouse = true;
                 const btn = parseInt(match[1], 10);
-                handleMouseWheel(btn);
+                const col = parseInt(match[2], 10);
+                const row = parseInt(match[3], 10);
+                const action = match[4];
+                handleMouseEvent({ btn, col, row, action });
             }
 
             while ((match = normalRegex.exec(str)) !== null) {
                 hasMouse = true;
                 const btn = match[1].charCodeAt(0) - 32;
-                handleMouseWheel(btn);
+                const col = match[1].charCodeAt(1) - 32;
+                const row = match[1].charCodeAt(2) - 32;
+                handleMouseEvent({ btn, col, row, action: "M" });
             }
 
             if (hasMouse) {
                 str = str.replace(sgrRegex, "").replace(normalRegex, "");
             }
 
-            // Check if chunk ends with a partial escape sequence
-            const partial = str.match(/\x1b(\[<?[0-9;]*)?$/);
+            // Check if chunk ends with a partial mouse escape sequence (\x1b[<... or \x1b[M...)
+            const partial = str.match(/(\x1b\[<[0-9;]*|\x1b\[M[\s\S]{0,2})$/);
             if (partial) {
                 mousePartialBuffer = partial[0];
                 str = str.slice(0, partial.index);
@@ -797,6 +1026,9 @@ export async function runChatInterface({
 
     const onResize = () => {
         renderFull();
+        if (activePopup) {
+            activePopup.render();
+        }
     };
     process.stdout.on("resize", onResize);
 
@@ -811,41 +1043,6 @@ export async function runChatInterface({
             }
         };
 
-        const detachReadlineListeners = () => {
-            for (const fn of savedRlKeypressListeners) {
-                process.stdin.removeListener("keypress", fn);
-            }
-        };
-
-        const suspendChatMode = () => {
-            process.stdout.write("\x1b[?7h\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h");
-            process.stdin.removeListener("keypress", onKey);
-            if (origEmit) {
-                process.stdin.emit = origEmit;
-            }
-            restoreReadlineListeners();
-            if (typeof process.stdin.setRawMode === "function") {
-                process.stdin.setRawMode(false);
-            }
-            if (rl) {
-                rl.resume();
-            }
-        };
-
-        const resumeChatMode = () => {
-            process.stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[2J\x1b[H");
-            detachReadlineListeners();
-            if (rl) {
-                rl.pause();
-            }
-            if (typeof process.stdin.setRawMode === "function") {
-                process.stdin.setRawMode(true);
-            }
-            process.stdin.resume();
-            process.stdin.emit = mouseDataHandler;
-            process.stdin.on("keypress", onKey);
-        };
-
         const cleanup = () => {
             if (cleanedUp) return;
             cleanedUp = true;
@@ -855,6 +1052,11 @@ export async function runChatInterface({
                 clearTimeout(streamRenderTimer);
                 streamRenderTimer = null;
             }
+            if (heartbeatTimer) {
+                clearInterval(heartbeatTimer);
+                heartbeatTimer = null;
+            }
+            sendDisconnect(currentHost);
             clearInterval(refreshTimer);
 
             process.stdout.removeListener("resize", onResize);
@@ -868,8 +1070,8 @@ export async function runChatInterface({
             }
             restoreReadlineListeners();
 
-            // Disable mouse reporting, restore autowrap, restore primary screen buffer, show cursor
-            process.stdout.write("\x1b[?7h\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h");
+            // Disable mouse reporting, restore cursor shape/color, restore autowrap, restore primary screen buffer, show cursor
+            process.stdout.write("\x1b[?7h\x1b[?1003l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[0 q\x1b]112\x07\x1b[?1049l\x1b[?25h");
 
             if (typeof process.stdin.setRawMode === "function") {
                 process.stdin.setRawMode(false);
@@ -877,6 +1079,304 @@ export async function runChatInterface({
             if (rl) {
                 rl.resume();
             }
+        };
+
+        /**
+         * Opens an in-place centered modal popup over the chat interface.
+         * Supports live Search filtering, Up/Down arrow navigation, mouse hover highlight,
+         * mouse click selection, click-outside dismissal, and Esc cancellation.
+         */
+        const openSelectionPopup = ({
+            title,
+            items: initialItems = [],
+            activeValue,
+            emptyMessage = "No items available",
+            subtitle = ""
+        }) => {
+            let allItems = [...initialItems];
+            let currentSubtitle = subtitle;
+            let searchQuery = "";
+            let scrollTop = 0;
+            let isClosed = false;
+
+            const getFiltered = () => {
+                if (!searchQuery.trim()) return allItems;
+                const q = searchQuery.trim().toLowerCase();
+                return allItems.filter((item) =>
+                    (item.label || "").toLowerCase().includes(q) ||
+                    (item.searchText || "").toLowerCase().includes(q)
+                );
+            };
+
+            let filtered = getFiltered();
+            let selectedIndex = Math.max(0, filtered.findIndex((it) => it.isActive || (activeValue !== undefined && it.value === activeValue)));
+
+            const getPopupGeometry = () => {
+                const { rows, cols } = getTerminalDimensions();
+                const popupWidth = Math.max(36, Math.min(68, cols - 6));
+                const leftCol = Math.max(2, Math.floor((cols - popupWidth) / 2) + 1);
+                const rightCol = leftCol + popupWidth - 1;
+                const innerWidth = popupWidth - 4;
+                const maxVisibleItems = Math.max(3, Math.min(14, rows - 10));
+                const visibleCount = Math.min(maxVisibleItems, Math.max(1, allItems.length));
+                // 1 top pad + 1 header + 1 gap + 1 search + 1 gap + visibleCount + 1 gap + 1 footer + 1 bottom pad
+                const totalHeight = 8 + visibleCount;
+                const topRow = Math.max(2, Math.floor((rows - totalHeight) / 2) + 1);
+                const bottomRow = topRow + totalHeight - 1;
+                const listStartRow = topRow + 5;
+                const listEndRow = listStartRow + visibleCount - 1;
+                return {
+                    rows, cols, popupWidth, leftCol, rightCol, innerWidth,
+                    visibleCount, totalHeight, topRow, bottomRow, listStartRow, listEndRow
+                };
+            };
+
+            const clampSelection = (geom) => {
+                filtered = getFiltered();
+                if (filtered.length === 0) {
+                    selectedIndex = 0;
+                    scrollTop = 0;
+                    return;
+                }
+                selectedIndex = Math.max(0, Math.min(selectedIndex, filtered.length - 1));
+                if (selectedIndex < scrollTop) {
+                    scrollTop = selectedIndex;
+                } else if (selectedIndex >= scrollTop + geom.visibleCount) {
+                    scrollTop = selectedIndex - geom.visibleCount + 1;
+                }
+                scrollTop = Math.max(0, Math.min(scrollTop, Math.max(0, filtered.length - geom.visibleCount)));
+            };
+
+            const renderPopup = () => {
+                if (isClosed || isExited) return;
+                const geom = getPopupGeometry();
+                clampSelection(geom);
+
+                const modalBg = "\x1b[48;2;24;25;32m";
+                const hoverBg = "\x1b[48;2;255;168;108m";
+                const hoverFg = "\x1b[1;38;2;20;20;24m";
+                const hoverMetaFg = "\x1b[22;38;2;65;50;35m";
+                const cursorBlock = "\x1b[48;2;245;150;80m\x1b[38;2;20;20;24m";
+                const normalMetaFg = "\x1b[22;2;37m";
+
+                const makeModalRow = (content, contentCells) => {
+                    const pad = Math.max(0, geom.innerWidth - contentCells);
+                    return `${modalBg}  ${content}${modalBg}${" ".repeat(pad)}  ${colors.reset}`;
+                };
+
+                const rowsOut = [];
+                // 1. Top padding
+                rowsOut.push(`${modalBg}${" ".repeat(geom.popupWidth)}${colors.reset}`);
+
+                // 2. Header: Title on left, status/esc on right
+                const rightText = currentSubtitle ? `${currentSubtitle} · esc` : "esc";
+                const clippedTitle = clipToWidth(title, Math.max(8, geom.innerWidth - getCellWidth(rightText) - 2));
+                const titleGap = Math.max(1, geom.innerWidth - getCellWidth(clippedTitle) - getCellWidth(rightText));
+                rowsOut.push(makeModalRow(
+                    `${colors.white}${clippedTitle}${" ".repeat(titleGap)}${normalMetaFg}${rightText}`,
+                    getCellWidth(clippedTitle) + titleGap + getCellWidth(rightText)
+                ));
+
+                // 3. Gap
+                rowsOut.push(`${modalBg}${" ".repeat(geom.popupWidth)}${colors.reset}`);
+
+                // 4. Search row
+                if (!searchQuery) {
+                    const searchContent = `${cursorBlock}S${modalBg}${normalMetaFg}earch`;
+                    rowsOut.push(makeModalRow(searchContent, 6));
+                } else {
+                    const qClipped = clipToWidth(searchQuery, Math.max(1, geom.innerWidth - 1));
+                    const qCells = getCellWidth(qClipped);
+                    const searchContent = `${colors.white}${qClipped}${cursorBlock} ${modalBg}`;
+                    rowsOut.push(makeModalRow(searchContent, qCells + 1));
+                }
+
+                // 5. Gap
+                rowsOut.push(`${modalBg}${" ".repeat(geom.popupWidth)}${colors.reset}`);
+
+                // 6. Item list rows
+                if (filtered.length === 0) {
+                    const emptyClipped = clipToWidth(emptyMessage, Math.max(4, geom.innerWidth - 2));
+                    rowsOut.push(makeModalRow(`${normalMetaFg}  ${emptyClipped}`, 2 + getCellWidth(emptyClipped)));
+                    for (let i = 1; i < geom.visibleCount; i++) {
+                        rowsOut.push(`${modalBg}${" ".repeat(geom.popupWidth)}${colors.reset}`);
+                    }
+                } else {
+                    for (let i = 0; i < geom.visibleCount; i++) {
+                        const idx = scrollTop + i;
+                        if (idx >= filtered.length) {
+                            rowsOut.push(`${modalBg}${" ".repeat(geom.popupWidth)}${colors.reset}`);
+                            continue;
+                        }
+                        const item = filtered[idx];
+                        const isHovered = (idx === selectedIndex);
+                        const isActive = Boolean(item.isActive || (activeValue !== undefined && item.value === activeValue));
+                        const rowBg = isHovered ? hoverBg : modalBg;
+                        const bullet = isActive ? "● " : "  ";
+                        const bulletFg = isHovered ? hoverFg : (isActive ? colors.orange : "");
+                        const labelFg = isHovered ? hoverFg : (isActive ? colors.orange : colors.white);
+                        const metaFg = isHovered ? hoverMetaFg : normalMetaFg;
+
+                        const metaText = item.meta ? clipToWidth(item.meta, Math.floor(geom.innerWidth * 0.42)) : "";
+                        const metaCells = getCellWidth(metaText);
+                        const maxLabelWidth = Math.max(4, geom.innerWidth - 2 - (metaCells > 0 ? metaCells + 2 : 0));
+                        const labelText = clipToWidth(item.label, maxLabelWidth);
+                        const labelCells = getCellWidth(labelText);
+                        const gap = Math.max(0, geom.innerWidth - 2 - labelCells - metaCells);
+
+                        rowsOut.push(
+                            `${rowBg}  ${bulletFg}${bullet}${labelFg}${labelText}${" ".repeat(gap)}${metaFg}${metaText}  ${colors.reset}`
+                        );
+                    }
+                }
+
+                // 7. Gap
+                rowsOut.push(`${modalBg}${" ".repeat(geom.popupWidth)}${colors.reset}`);
+
+                // 8. Footer hints
+                const footerText = clipToWidth("↑/↓ navigate   enter select   esc close", geom.innerWidth);
+                rowsOut.push(makeModalRow(`${normalMetaFg}${footerText}`, getCellWidth(footerText)));
+
+                // 9. Bottom padding
+                rowsOut.push(`${modalBg}${" ".repeat(geom.popupWidth)}${colors.reset}`);
+
+                process.stdout.write("\x1b[?25l\x1b[?7l");
+                try {
+                    let out = "";
+                    for (let i = 0; i < rowsOut.length; i++) {
+                        out += `\x1b[${geom.topRow + i};${geom.leftCol}H${rowsOut[i]}`;
+                    }
+                    process.stdout.write(out);
+                } finally {
+                    process.stdout.write("\x1b[?7h");
+                }
+            };
+
+            let resolvePopup;
+            const promise = new Promise((res) => {
+                resolvePopup = res;
+            });
+
+            const closePopup = (result) => {
+                if (isClosed) return;
+                isClosed = true;
+                activePopup = null;
+                // Disable any-event mouse motion tracking when popup closes
+                process.stdout.write("\x1b[?1003l");
+                renderFull();
+                resolvePopup(result);
+            };
+
+            activePopup = {
+                render: renderPopup,
+                onMouse: ({ btn, col, row, action }) => {
+                    if (isClosed) return;
+                    const geom = getPopupGeometry();
+
+                    // Mouse wheel scroll inside popup
+                    if ((btn & 64) !== 0) {
+                        if (filtered.length > geom.visibleCount) {
+                            if ((btn & 3) === 0) {
+                                scrollTop = Math.max(0, scrollTop - 2);
+                                selectedIndex = Math.max(0, selectedIndex - 2);
+                            } else if ((btn & 3) === 1) {
+                                scrollTop = Math.min(Math.max(0, filtered.length - geom.visibleCount), scrollTop + 2);
+                                selectedIndex = Math.min(filtered.length - 1, selectedIndex + 2);
+                            }
+                            renderPopup();
+                        }
+                        return;
+                    }
+
+                    // Hover (motion bit 32)
+                    if ((btn & 32) !== 0) {
+                        if (col >= geom.leftCol && col <= geom.rightCol && row >= geom.listStartRow && row <= geom.listEndRow) {
+                            const idx = scrollTop + (row - geom.listStartRow);
+                            if (idx >= 0 && idx < filtered.length && idx !== selectedIndex) {
+                                selectedIndex = idx;
+                                renderPopup();
+                            }
+                        }
+                        return;
+                    }
+
+                    // Left click (btn === 0, press 'M')
+                    if (btn === 0 && action === "M") {
+                        const insideBox = col >= geom.leftCol && col <= geom.rightCol && row >= geom.topRow && row <= geom.bottomRow;
+                        if (!insideBox) {
+                            closePopup(null);
+                            return;
+                        }
+                        if (row >= geom.listStartRow && row <= geom.listEndRow) {
+                            const idx = scrollTop + (row - geom.listStartRow);
+                            if (idx >= 0 && idx < filtered.length) {
+                                closePopup(filtered[idx].value);
+                            }
+                        }
+                    }
+                },
+                onKey: (str, key) => {
+                    if (isClosed) return;
+                    if (key && key.name === "escape") {
+                        closePopup(null);
+                        return;
+                    }
+                    if (key && key.name === "up") {
+                        if (filtered.length > 0) {
+                            selectedIndex = (selectedIndex - 1 + filtered.length) % filtered.length;
+                            renderPopup();
+                        }
+                        return;
+                    }
+                    if (key && key.name === "down") {
+                        if (filtered.length > 0) {
+                            selectedIndex = (selectedIndex + 1) % filtered.length;
+                            renderPopup();
+                        }
+                        return;
+                    }
+                    if (key && (key.name === "return" || key.name === "enter")) {
+                        const chosen = filtered[selectedIndex] ? filtered[selectedIndex].value : null;
+                        closePopup(chosen);
+                        return;
+                    }
+                    if (key && (key.name === "backspace" || key.name === "delete")) {
+                        if (searchQuery.length > 0) {
+                            searchQuery = searchQuery.slice(0, -1);
+                            selectedIndex = 0;
+                            scrollTop = 0;
+                            renderPopup();
+                        }
+                        return;
+                    }
+                    if (str && !key?.ctrl && !key?.meta && !/[\x00-\x1f\x7f]/.test(str)) {
+                        searchQuery += str;
+                        selectedIndex = 0;
+                        scrollTop = 0;
+                        renderPopup();
+                    }
+                }
+            };
+
+            // Enable any-event mouse tracking (1003h) so hover highlights rows immediately
+            process.stdout.write("\x1b[?1003h");
+            renderPopup();
+
+            return {
+                promise,
+                updateItems: (newItems, newSubtitle = "") => {
+                    if (isClosed) return;
+                    allItems = [...newItems];
+                    currentSubtitle = newSubtitle;
+                    const oldH = getPopupGeometry().totalHeight;
+                    const newFiltered = getFiltered();
+                    selectedIndex = Math.max(0, newFiltered.findIndex((it) => it.isActive || (activeValue !== undefined && it.value === activeValue)));
+                    if (getPopupGeometry().totalHeight !== oldH) {
+                        renderFull();
+                    }
+                    renderPopup();
+                }
+            };
         };
 
         const sigintHandler = () => {
@@ -897,6 +1397,12 @@ export async function runChatInterface({
                 process.exit(0);
             }
 
+            // Route all keyboard input to active modal popup when open
+            if (activePopup) {
+                activePopup.onKey(str, key);
+                return;
+            }
+
             // Keyboard scrolling: PageUp / PageDown / Up / Down
             const layout = getLayout();
             const maxScroll = getMaxScroll(layout);
@@ -914,10 +1420,220 @@ export async function runChatInterface({
                 return;
             }
 
-            // Backspace / Delete
-            if (key && (key.name === "backspace" || key.name === "delete")) {
+            const deleteActiveSelection = () => {
+                const sel = getSelectionRange();
+                if (!sel) return false;
+                inputVal = inputVal.slice(0, sel[0]) + inputVal.slice(sel[1]);
+                cursorIndex = sel[0];
+                selectionAnchor = null;
+                return true;
+            };
+
+            // Ctrl+X: Cut selected text (or entire input if no selection) to clipboard
+            if (key && key.ctrl && key.name === "x") {
+                const sel = getSelectionRange();
+                if (sel) {
+                    const cutText = inputVal.slice(sel[0], sel[1]);
+                    internalClipboard = cutText;
+                    copyToClipboard(cutText);
+                    deleteActiveSelection();
+                    scrollOffset = 0;
+                    syncInputBox();
+                } else if (inputVal.length > 0) {
+                    internalClipboard = inputVal;
+                    copyToClipboard(inputVal);
+                    inputVal = "";
+                    cursorIndex = 0;
+                    selectionAnchor = null;
+                    scrollOffset = 0;
+                    syncInputBox();
+                }
+                return;
+            }
+
+            // Ctrl+V / Ctrl+Y: Paste from clipboard at cursorIndex (replacing selection if any)
+            if (key && key.ctrl && (key.name === "v" || key.name === "y")) {
+                const pasted = readFromClipboard(internalClipboard).replace(/[\r\n]+/g, " ");
+                if (pasted) {
+                    deleteActiveSelection();
+                    inputVal = inputVal.slice(0, cursorIndex) + pasted + inputVal.slice(cursorIndex);
+                    cursorIndex += pasted.length;
+                    scrollOffset = 0;
+                    syncInputBox();
+                }
+                return;
+            }
+
+            // Ctrl+A: Select all text in input box
+            if (key && key.ctrl && key.name === "a") {
                 if (inputVal.length > 0) {
-                    inputVal = inputVal.slice(0, -1);
+                    selectionAnchor = 0;
+                    cursorIndex = inputVal.length;
+                    renderInputBox(layout);
+                }
+                return;
+            }
+
+            // Home / Shift+Home
+            if (key && key.name === "home") {
+                if (key.shift) {
+                    if (selectionAnchor === null) selectionAnchor = cursorIndex;
+                } else {
+                    selectionAnchor = null;
+                }
+                cursorIndex = 0;
+                renderInputBox(layout);
+                return;
+            }
+
+            // Ctrl+E / End / Shift+End
+            if (key && ((key.ctrl && key.name === "e") || key.name === "end")) {
+                if (key.shift && !key.ctrl) {
+                    if (selectionAnchor === null) selectionAnchor = cursorIndex;
+                } else {
+                    selectionAnchor = null;
+                }
+                cursorIndex = inputVal.length;
+                renderInputBox(layout);
+                return;
+            }
+
+            // Ctrl+U: Delete from start of input to cursor
+            if (key && key.ctrl && key.name === "u") {
+                if (deleteActiveSelection() || cursorIndex > 0) {
+                    if (cursorIndex > 0 && selectionAnchor === null) {
+                        inputVal = inputVal.slice(cursorIndex);
+                        cursorIndex = 0;
+                    }
+                    scrollOffset = 0;
+                    syncInputBox();
+                }
+                return;
+            }
+
+            // Ctrl+K: Delete from cursor to end of input
+            if (key && key.ctrl && key.name === "k") {
+                if (deleteActiveSelection() || cursorIndex < inputVal.length) {
+                    if (cursorIndex < inputVal.length && selectionAnchor === null) {
+                        inputVal = inputVal.slice(0, cursorIndex);
+                    }
+                    scrollOffset = 0;
+                    syncInputBox();
+                }
+                return;
+            }
+
+            // Ctrl+W / Ctrl+Backspace: Delete previous word (or active selection)
+            if (key && key.ctrl && (key.name === "w" || key.name === "backspace")) {
+                if (deleteActiveSelection()) {
+                    scrollOffset = 0;
+                    syncInputBox();
+                    return;
+                }
+                if (cursorIndex > 0) {
+                    const before = inputVal.slice(0, cursorIndex);
+                    const trimmedEnd = before.replace(/\s+$/, "");
+                    const lastSpace = trimmedEnd.lastIndexOf(" ");
+                    const newIdx = lastSpace === -1 ? 0 : lastSpace + 1;
+                    inputVal = inputVal.slice(0, newIdx) + inputVal.slice(cursorIndex);
+                    cursorIndex = newIdx;
+                    scrollOffset = 0;
+                    syncInputBox();
+                }
+                return;
+            }
+
+            // Left / Shift+Left / Ctrl+Left / Ctrl+Shift+Left
+            if (key && key.name === "left") {
+                if (key.shift) {
+                    if (selectionAnchor === null) selectionAnchor = cursorIndex;
+                    if (cursorIndex > 0) {
+                        if (key.ctrl) {
+                            const before = inputVal.slice(0, cursorIndex).replace(/\s+$/, "");
+                            const lastSpace = before.lastIndexOf(" ");
+                            cursorIndex = lastSpace === -1 ? 0 : lastSpace + 1;
+                        } else {
+                            cursorIndex--;
+                        }
+                    }
+                    if (selectionAnchor === cursorIndex) selectionAnchor = null;
+                    renderInputBox(layout);
+                    return;
+                }
+                const hadSel = getSelectionRange();
+                if (hadSel) {
+                    cursorIndex = hadSel[0];
+                    selectionAnchor = null;
+                    renderInputBox(layout);
+                } else if (cursorIndex > 0) {
+                    if (key.ctrl) {
+                        const before = inputVal.slice(0, cursorIndex).replace(/\s+$/, "");
+                        const lastSpace = before.lastIndexOf(" ");
+                        cursorIndex = lastSpace === -1 ? 0 : lastSpace + 1;
+                    } else {
+                        cursorIndex--;
+                    }
+                    renderInputBox(layout);
+                }
+                return;
+            }
+
+            // Right / Shift+Right / Ctrl+Right / Ctrl+Shift+Right
+            if (key && key.name === "right") {
+                if (key.shift) {
+                    if (selectionAnchor === null) selectionAnchor = cursorIndex;
+                    if (cursorIndex < inputVal.length) {
+                        if (key.ctrl) {
+                            const after = inputVal.slice(cursorIndex);
+                            const match = after.match(/^\s*\S+/);
+                            cursorIndex = match ? cursorIndex + match[0].length : inputVal.length;
+                        } else {
+                            cursorIndex++;
+                        }
+                    }
+                    if (selectionAnchor === cursorIndex) selectionAnchor = null;
+                    renderInputBox(layout);
+                    return;
+                }
+                const hadSel = getSelectionRange();
+                if (hadSel) {
+                    cursorIndex = hadSel[1];
+                    selectionAnchor = null;
+                    renderInputBox(layout);
+                } else if (cursorIndex < inputVal.length) {
+                    if (key.ctrl) {
+                        const after = inputVal.slice(cursorIndex);
+                        const match = after.match(/^\s*\S+/);
+                        cursorIndex = match ? cursorIndex + match[0].length : inputVal.length;
+                    } else {
+                        cursorIndex++;
+                    }
+                    renderInputBox(layout);
+                }
+                return;
+            }
+
+            // Backspace: Delete active selection, or character before cursor
+            if (key && key.name === "backspace") {
+                if (deleteActiveSelection()) {
+                    scrollOffset = 0;
+                    syncInputBox();
+                } else if (cursorIndex > 0) {
+                    inputVal = inputVal.slice(0, cursorIndex - 1) + inputVal.slice(cursorIndex);
+                    cursorIndex--;
+                    scrollOffset = 0;
+                    syncInputBox();
+                }
+                return;
+            }
+
+            // Delete: Delete active selection, or character at cursor
+            if (key && key.name === "delete") {
+                if (deleteActiveSelection()) {
+                    scrollOffset = 0;
+                    syncInputBox();
+                } else if (cursorIndex < inputVal.length) {
+                    inputVal = inputVal.slice(0, cursorIndex) + inputVal.slice(cursorIndex + 1);
                     scrollOffset = 0;
                     syncInputBox();
                 }
@@ -932,6 +1648,8 @@ export async function runChatInterface({
 
                 const submitted = inputVal.trim();
                 inputVal = "";
+                cursorIndex = 0;
+                selectionAnchor = null;
                 scrollOffset = 0; // Automatically return to latest messages on submit
                 const postLayout = getLayout();
                 currentInputRows = postLayout.inputRows;
@@ -965,43 +1683,126 @@ export async function runChatInterface({
                 if (cmd === "/help") {
                     messages.push({
                         role: "system",
-                        content: "Available Commands:\n  /models  - Switch active model on this laptop\n  /hosts   - Switch to a different laptop on LAN\n  /clear   - Clear conversation history\n  /exit    - Exit chat"
+                        content: "Available Commands:\n  /settings - Select preferred mode (Client / Host)\n  /models  - Switch active model on this laptop\n  /hosts   - Switch to a different laptop on LAN\n  /clear   - Clear conversation history\n  /exit    - Exit chat"
                     });
                     renderConversation(postLayout);
                     renderInputBox(postLayout);
                     return;
                 }
 
-                // 4. /models or /model
-                if (cmd === "/models" || cmd === "/model") {
-                    suspendChatMode();
+                // 3.5. /settings -> In-place modal popup
+                if (cmd === "/settings") {
+                    renderConversation(postLayout);
+                    renderInputBox(postLayout);
 
-                    const newModel = await selectModelPrompt(rl, currentHost, currentModel);
-                    if (newModel && newModel !== currentModel) {
-                        currentModel = newModel;
-                        messages.push({ role: "system", content: `[Switched active model to ${currentModel}]` });
-                    }
-
-                    resumeChatMode();
-                    renderFull();
+                    const preferred = getPreferredMode();
+                    openSettingsModalPopup({
+                        initialSavedMode: preferred,
+                        onClose: () => {
+                            renderFull();
+                        },
+                        onSelect: (chosenMode) => {
+                            if (chosenMode === "client") {
+                                setPreferredMode("client");
+                                messages.push({ role: "system", content: "[Settings: Saved preferred mode 'Client']" });
+                                renderFull();
+                            } else if (chosenMode === "host") {
+                                messages.push({ role: "system", content: "[Settings: To start Host mode, exit chat and run 'teamgpu host']" });
+                                renderFull();
+                            }
+                        }
+                    });
                     return;
                 }
 
-                // 5. /hosts or /host
-                if (cmd === "/hosts" || cmd === "/host") {
-                    suspendChatMode();
+                // 4. /models or /model -> In-place centered popup
+                if (cmd === "/models" || cmd === "/model") {
+                    renderConversation(postLayout);
+                    renderInputBox(postLayout);
 
-                    const newHost = await selectHostPrompt(rl);
-                    if (newHost) {
-                        currentHost = { ...newHost };
-                        const newModel = await selectModelPrompt(rl, currentHost);
-                        if (newModel) currentModel = newModel;
-                        messages.length = 0;
-                        messages.push({ role: "system", content: `[Connected to ${currentHost.name} (${currentModel})]` });
+                    const initialModels = currentHost.models || (currentModel ? [currentModel] : []);
+                    const modelItems = (list) => list.map((m) => ({
+                        label: m,
+                        value: m,
+                        isActive: m === currentModel,
+                        meta: m === currentModel ? "Active" : ""
+                    }));
+
+                    const popup = openSelectionPopup({
+                        title: "Select model",
+                        items: modelItems(initialModels),
+                        activeValue: currentModel,
+                        emptyMessage: "No models found",
+                        subtitle: currentHost.name || ""
+                    });
+
+                    // Refresh model list from host in background while popup is open
+                    probeHost(currentHost.url, 1800).then((fresh) => {
+                        if (fresh?.models?.length > 0) {
+                            currentHost = { ...currentHost, ...fresh, online: true };
+                            popup.updateItems(modelItems(fresh.models), currentHost.name || "");
+                        }
+                    }).catch(() => {});
+
+                    const chosenModel = await popup.promise;
+                    if (chosenModel && chosenModel !== currentModel) {
+                        currentModel = chosenModel;
+                        messages.push({ role: "system", content: `[Switched active model to ${currentModel}]` });
+                        renderFull();
                     }
+                    return;
+                }
 
-                    resumeChatMode();
-                    renderFull();
+                // 5. /hosts or /host -> In-place centered popup
+                if (cmd === "/hosts" || cmd === "/host") {
+                    renderConversation(postLayout);
+                    renderInputBox(postLayout);
+
+                    const hostItems = (list) => list.map((h) => {
+                        const isCur = h.url === currentHost.url || (h.name === currentHost.name && h.ip === currentHost.ip);
+                        const gpuShort = h.gpu?.detected ? (h.gpu.model || "GPU").replace(/NVIDIA GeForce /i, "") : "CPU";
+                        const statusDot = h.ollama?.running !== false ? "Online" : "Offline";
+                        return {
+                            label: h.name || h.ip || h.url,
+                            value: h,
+                            isActive: isCur,
+                            searchText: `${h.ip || ""} ${gpuShort}`,
+                            meta: `${gpuShort} · ${statusDot}`
+                        };
+                    });
+
+                    const popup = openSelectionPopup({
+                        title: "Select host",
+                        items: hostItems([currentHost]),
+                        activeValue: currentHost,
+                        emptyMessage: "No TeamGPU hosts found",
+                        subtitle: "Scanning LAN..."
+                    });
+
+                    // Discover hosts on LAN without leaving the chat screen
+                    discoverHosts({ timeoutMs: 1800 }).then((found) => {
+                        const list = found.length > 0 ? found : [currentHost];
+                        if (!list.some((h) => h.url === currentHost.url)) {
+                            list.unshift(currentHost);
+                        }
+                        popup.updateItems(hostItems(list), `${list.length} found`);
+                    }).catch(() => {
+                        popup.updateItems(hostItems([currentHost]), "1 host");
+                    });
+
+                    const chosenHost = await popup.promise;
+                    if (chosenHost && (chosenHost.url !== currentHost.url || chosenHost.name !== currentHost.name)) {
+                        sendDisconnect(currentHost);
+                        currentHost = { ...chosenHost, online: true };
+                        sendHeartbeat(currentHost);
+                        if (Array.isArray(currentHost.models) && currentHost.models.length > 0) {
+                            if (!currentHost.models.includes(currentModel)) {
+                                currentModel = currentHost.models[0];
+                            }
+                        }
+                        messages.push({ role: "system", content: `[Switched host to ${currentHost.name} (${currentModel})]` });
+                        renderFull();
+                    }
                     return;
                 }
 
@@ -1023,11 +1824,16 @@ export async function runChatInterface({
                 try {
                     const response = await fetch(`${currentHost.url}/api/generate`, {
                         method: "POST",
-                        headers: { "Content-Type": "application/json" },
+                        headers: {
+                            "Content-Type": "application/json",
+                            "x-client-id": clientIdentity.id
+                        },
                         body: JSON.stringify({
                             model: currentModel,
                             messages,
-                            stream: true
+                            stream: true,
+                            clientId: clientIdentity.id,
+                            clientName: clientIdentity.name
                         })
                     });
 
@@ -1125,7 +1931,9 @@ export async function runChatInterface({
 
             // Normal typing or pasting printable characters into input box
             if (str && !key?.ctrl && !key?.meta && !/[\x00-\x1f\x7f]/.test(str)) {
-                inputVal += str;
+                deleteActiveSelection();
+                inputVal = inputVal.slice(0, cursorIndex) + str + inputVal.slice(cursorIndex);
+                cursorIndex += str.length;
                 scrollOffset = 0;
                 syncInputBox();
             }

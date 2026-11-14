@@ -20,10 +20,16 @@ function ensureConfigDir() {
     }
 }
 
+let cachedIdentity = null;
+
 /**
  * Gets or creates a persistent device ID and display name for this machine.
  */
 export function getDeviceIdentity() {
+    if (cachedIdentity) {
+        return cachedIdentity;
+    }
+
     ensureConfigDir();
 
     let identity = null;
@@ -51,13 +57,15 @@ export function getDeviceIdentity() {
         }
     }
 
-    return {
+    cachedIdentity = {
         id: identity.id,
         name: identity.name || os.hostname(),
         hostname: os.hostname(),
         platform: os.platform(),
         arch: os.arch()
     };
+
+    return cachedIdentity;
 }
 
 /**
