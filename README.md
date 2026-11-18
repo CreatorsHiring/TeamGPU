@@ -1,163 +1,155 @@
-# TeamGPU Agent
+# TeamGPU
 
-A lightweight Node.js service that scans your machine's hardware (GPU, CPU, RAM) and provides an API to generate text using locally-running Ollama models.
+### P2P GPU Sharing Infrastructure
 
-## Features
+**TeamGPU** is a peer-to-peer GPU sharing infrastructure designed to make GPU compute accessible to developers by allowing them to share computational resources across their local network.
 
-- **Hardware Detection** — Automatically detects NVIDIA GPU, CPU, and RAM details.
-- **Ollama Integration** — Proxies generation requests to a local Ollama instance.
-- **Machine Info Endpoint** — Returns a complete hardware profile as JSON.
-- **CLI Client** — Interactive command-line tool for quick generation tests.
+Instead of every developer needing a powerful GPU to run local LLMs, TeamGPU allows teammates to connect to a machine with available GPU resources and use its compute remotely.
 
-## Prerequisites
+Have an idle GPU? Share it with your team.
 
-- **Node.js** v18+ (uses native `fetch`)
-- **Ollama** — must be running on `http://127.0.0.1:11434` for generation features
-- **NVIDIA GPU + nvidia-smi** — optional, for GPU detection
+Have a low-end laptop? Use your teammate's GPU.
+
+---
 
 ## Installation
 
-```bash
-git clone https://github.com/your-username/TeamGPU.git
-cd TeamGPU
-npm install
-```
-
-## Usage
-
-Start the server:
+Install TeamGPU globally using npm:
 
 ```bash
-npm start
+npm install -g @teamgpu/cli
 ```
 
-The server listens on **port 3000** by default.
+## Getting Started
 
-### Using the CLI
+After installation, launch TeamGPU:
 
 ```bash
-node src/cli/generate.js
+teamgpu
 ```
 
-You will be prompted for:
+On the first launch, TeamGPU will ask you to choose how you want to use it:
 
-1. **Server URL** (default: `http://localhost:3000`)
-2. **Model** (e.g., `llama3`, `mistral`)
-3. **Prompt**
+- **Host** — Share your machine's GPU compute with other teammates.
+- **Client** — Connect to another machine and use its available GPU compute.
 
-## API Reference
+---
 
-### `GET /machine`
+## Choosing Your Mode
 
-Returns a JSON object with hardware information.
+### 1. Host Mode
 
-**Response:**
+Choose **Host** if your machine has a GPU and you want to share its compute resources with other developers on your network.
 
-```json
-{
-  "gpu": {
-    "detected": true,
-    "vendor": "NVIDIA",
-    "model": "RTX 3090",
-    "memoryMB": 24576,
-    "driverVersion": "535.104.12",
-    "temperatureC": 45,
-    "utilizationPercent": 12,
-    "powerWatts": 35
-  },
-  "cpu": {
-    "detected": true,
-    "manufacturer": "Intel",
-    "model": "12th Gen Intel(R) Core(TM) i7-12700K",
-    "architecture": "x64",
-    "logicalCores": 20,
-    "speedMHz": 3600,
-    "speedGHz": 3.6
-  },
-  "memory": {
-    "detected": true,
-    "totalBytes": 34359738368,
-    "freeBytes": 17179869184,
-    "usedBytes": 17179869184,
-    "totalGB": 32,
-    "freeGB": 16,
-    "usedGB": 16
-  },
-  "ollama": {
-    "detected": true,
-    "running": true,
-    "version": "0.3.4",
-    "models": [
-      {
-        "name": "llama3",
-        "size": 4739761664,
-        "modifiedAt": "2024-06-20T12:00:00Z"
-      }
-    ]
-  }
-}
+TeamGPU is currently designed for **GPU compute sharing over a Local Area Network (LAN)**. Its purpose is to make underutilized GPUs accessible to teammates instead of leaving valuable compute resources idle.
+
+For example, imagine a development team where one member has a powerful GPU-equipped laptop, but they're primarily working on frontend development and aren't actively using their GPU. Other team members with low-end laptops could connect to that machine and utilize its GPU for running local LLM workloads.
+
+#### Host Requirements
+
+- A machine with a compatible GPU
+- [Ollama](https://ollama.com/) installed
+- The required LLM models downloaded locally through Ollama
+- TeamGPU installed
+
+The Host runs the inference workload locally and makes it accessible to connected clients over the network.
+
+**Your GPU becomes shared compute for your team.**
+
+---
+
+### 2. Client Mode
+
+Choose **Client** if you want to use GPU compute from another machine running TeamGPU in Host mode.
+
+Clients do not need their own dedicated GPU or Ollama installation. They can connect to an available host on the local network and use its compute resources to run LLM workloads.
+
+This makes TeamGPU useful for developers working on low-end laptops, machines without dedicated GPUs, or systems that cannot run larger models locally.
+
+#### How it works
+
+1. Launch TeamGPU.
+2. Choose Client mode.
+3. Discover or connect to an available Host on your network.
+4. Connect and start using the remote compute resources.
+
+Your prompts are processed by the Host machine, which runs the model using its own hardware.
+
+---
+
+## Switching Between Host and Client
+
+Your selected Client preference is saved, so TeamGPU can take you back to Client mode when you launch it again.
+
+But you're not locked into that choice.
+
+If you initially choose Client and later want to share your GPU with your team, you can switch modes at any time.
+
+### Switch from Client to Host
+
+1. Launch TeamGPU.
+2. Open the Client interface.
+3. Type:
+
+```text
+/settings
 ```
 
-### `POST /api/generate`
+4. Open the settings page.
+5. Choose Host mode to start sharing your machine's compute resources.
 
-Sends a generation request to the local Ollama instance.
+Host mode is temporary and does not overwrite your saved Client preference. When you launch TeamGPU again, it will return to your preferred Client mode.
 
-**Request Body:**
+---
 
-```json
-{
-  "model": "llama3",
-  "prompt": "Explain what a GPU is in simple terms."
-}
-```
+## Why TeamGPU?
 
-**Parameters:**
+GPU hardware is expensive, yet within development teams, computational resources often go unused.
 
-| Field    | Type   | Required | Description                    |
-| -------- | ------ | -------- | ------------------------------ |
-| `model`  | string | Yes      | Ollama model name              |
-| `prompt` | string | Yes      | The prompt to send             |
+At the same time, developers with low-end hardware struggle to run local AI models, experiment with LLMs, and build AI-powered applications.
 
-**Response:** Returns the raw Ollama response object.
+TeamGPU aims to bridge that gap by connecting machines and making GPU compute shareable.
 
-**Error Responses:**
+Instead of every developer purchasing expensive hardware, teams can make better use of the GPUs they already own.
 
-| Status | Meaning                        |
-| ------ | ------------------------------ |
-| `400`  | Missing `model` or `prompt`    |
-| `502`  | Ollama returned an error       |
-| `500`  | Internal server error          |
+### The Idea
 
-## Project Structure
+- **Share GPUs:** Make unused GPU resources available to teammates.
+- **Access Remote Compute:** Run LLM workloads using another machine's GPU.
+- **Lower Hardware Barriers:** Give developers without powerful GPUs access to compute.
+- **Peer-to-Peer Infrastructure:** Connect machines directly within a local network.
 
-```
-TeamGPU/
-├── package.json
-├── src/
-│   ├── index.js              # Express app entry point
-│   ├── scanner.js            # Aggregates all scanner modules
-│   ├── routes/
-│   │   ├── machine.js        # GET /machine handler
-│   │   └── generate.js       # POST /api/generate handler
-│   ├── scanners/
-│   │   ├── gpu.js            # NVIDIA GPU detection (nvidia-smi)
-│   │   ├── cpu.js            # CPU detection (os module)
-│   │   ├── ram.js            # RAM detection (os module)
-│   │   └── ollama.js         # Ollama install + running check
-│   ├── cli/
-│   │   └── generate.js       # Interactive CLI client
-│   └── utils/
-│       └── exec.js           # Shell command runner
-```
+---
 
-## How It Works
+## Current Capabilities
 
-1. **Hardware Scanning** — The `GET /machine` endpoint runs each scanner (GPU, CPU, RAM, Ollama) in parallel and aggregates the results.
-2. **GPU Detection** — Runs `nvidia-smi` via shell; gracefully returns `{ detected: false }` on non-NVIDIA systems or missing drivers.
-3. **Generation Proxy** — `POST /api/generate` validates input, then forwards the request to Ollama's local API at `127.0.0.1:11434`.
+TeamGPU currently focuses on **LLM inference over LAN**.
 
-## Notes
+The current implementation is designed for devices connected to the same local network, such as the same Wi-Fi or LAN.
 
-- The `run()` utility (`src/utils/exec.js`) swallows shell errors and returns `null` on failure. Callers must always null-check the result.
-- The GPU scanner only supports NVIDIA GPUs; AMD/Intel GPU detection is not implemented.
-- Ollama must be installed and running separately — this project does not manage Ollama's lifecycle.
+| Role    | Responsibilities                                                            |
+| ------- | --------------------------------------------------------------------------- |
+| Host    | Runs Ollama, models, and inference workloads                                |
+| Client  | Connects to a Host and sends inference requests                             |
+| TeamGPU | Handles machine discovery, connectivity, and remote inference communication |
+
+---
+
+## The Vision
+
+LAN-based GPU sharing is the beginning.
+
+Our long-term vision is to build a decentralized GPU compute infrastructure where developers can access GPU resources beyond their local network.
+
+We envision a future where:
+
+- GPU owners can share their unused compute resources.
+- Developers can access remote GPU compute on demand.
+- AI engineers can run workloads on distributed GPU infrastructure.
+- Developers can use GPU compute for inference, fine-tuning, training, and other compute-intensive workloads.
+
+**Our goal is to make GPU compute more accessible, efficient, and collaborative.**
+
+---
+
+**TeamGPU — Share Compute. Build Without Limits.**
