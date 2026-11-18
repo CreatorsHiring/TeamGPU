@@ -1,9 +1,17 @@
 {
-  "name": "teamgpu-agent",
-  "version": "0.0.1",
+  "name": "@teamgpu/cli",
+  "version": "0.1.0",
+  "description": "Peer-to-peer GPU sharing platform for developers",
   "type": "module",
   "bin": {
     "teamgpu": "./src/cli/index.js"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
   },
   "scripts": {
     "start": "node src/index.js"
